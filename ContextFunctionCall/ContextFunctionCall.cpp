@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <iostream> // For std::cerr and std::cout
 #include <vector>   // For std::vector
+#include <string>   // For constructing test messages/paths if needed
 #include <cstdio>   // For printf (used in debug prints)
 
 // Define a preprocessor macro for debug prints
@@ -48,6 +49,7 @@ bool ExecuteApiViaSetThreadContext(
     HANDLE hThread,
     const HijackContext& context)
 {
+    // ... (implementation remains the same as before) ...
     if (!hThread || !context.targetApiAddress || !context.pPreparedStackTop) {
         SetLastError(ERROR_INVALID_PARAMETER);
         std::cerr << "ExecuteApiViaSetThreadContext: ERROR - Invalid parameters." << std::endl;
@@ -62,10 +64,8 @@ bool ExecuteApiViaSetThreadContext(
             << context.pPreparedStackTop << std::endl;
         return false;
     }
-
     CONTEXT threadContext;
-    threadContext.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER; // We'll modify control and integer registers.
-
+    threadContext.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
     if (!GetThreadContext(hThread, &threadContext)) {
         std::cerr << "ExecuteApiViaSetThreadContext: ERROR - GetThreadContext failed. Error: " << GetLastError() << std::endl;
         return false;
@@ -94,12 +94,11 @@ bool ExecuteApiViaSetThreadContext(
         std::cerr << "ExecuteApiViaSetThreadContext: ERROR - SetThreadContext failed. Error: " << GetLastError() << std::endl;
         return false;
     }
-
     return true;
 }
 
 /**
- * @brief A dummy thread procedure to keep a thread alive until it's hijacked or terminated.
+ * @brief A dummy thread procedure.
  */
 DWORD WINAPI DummyThreadProc(LPVOID lpParameter) {
     UNREFERENCED_PARAMETER(lpParameter);
@@ -138,6 +137,7 @@ void* PrepareStackForApiCall(
     FARPROC pRetAddressForApi,
     void** outStackAllocationBase
 ) {
+    // ... (implementation remains the same as before) ...
     if (!pRetAddressForApi || !outStackAllocationBase) {
         std::cerr << "PrepareStackForApiCall: ERROR - Null pRetAddressForApi or outStackAllocationBase." << std::endl;
         return nullptr;
@@ -157,17 +157,15 @@ void* PrepareStackForApiCall(
     SIZE_T allocationSize = 65536; // Default 64KB, generally sufficient for many APIs.
     SIZE_T minRequiredForOurData = retAddrSlotSize + shadowSpaceSize + totalStackArgsSizeBytes + 16 /*alignment margin*/;
     if (allocationSize < minRequiredForOurData) {
-        allocationSize = minRequiredForOurData + 4096; // Add an extra page if minRequired is large
+        allocationSize = minRequiredForOurData + 4096;
         DEBUG_COUT("  INFO: Increased allocationSize to " << allocationSize << " due to argument data size." << std::endl);
     }
-
     void* stackBase = VirtualAlloc(NULL, allocationSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!stackBase) {
         std::cerr << "PrepareStackForApiCall: ERROR - VirtualAlloc failed. Error: " << GetLastError() << std::endl;
         return nullptr;
     }
-    *outStackAllocationBase = stackBase; // Return base for freeing
-
+    *outStackAllocationBase = stackBase;
     DEBUG_COUT("  DEBUG: PrepareStackForApiCall - stackBase = " << stackBase
         << ", allocationSize = " << allocationSize << std::endl);
 
@@ -185,7 +183,6 @@ void* PrepareStackForApiCall(
     // pProspectiveRsp is the unaligned RSP if the return address slot were placed directly
     // below the shadow space, which itself is below the 5th argument slot.
     char* pProspectiveRsp = pTentative_Addr_5th_Arg_Slot - shadowSpaceSize - retAddrSlotSize;
-
     DEBUG_COUT("  DEBUG: pStackHighWatermark (initial top for calc) = " << (void*)pStackHighWatermark << std::endl);
     DEBUG_COUT("  DEBUG: pTentative_Addr_5th_Arg_Slot (if args pushed from top) = " << (void*)pTentative_Addr_5th_Arg_Slot << std::endl);
     DEBUG_COUT("  DEBUG: pProspectiveRsp (unaligned RSP target) = " << (void*)pProspectiveRsp << std::endl);
@@ -216,7 +213,6 @@ void* PrepareStackForApiCall(
     //    The 5th argument goes to finalRspVal + firstStackArgOffset (RSP + 0x28).
     char* pArgWriter = (char*)finalRspVal + firstStackArgOffset;
     DEBUG_COUT("  DEBUG: Placing stack arguments relative to finalRspVal:" << std::endl);
-
     for (size_t i = 0; i < numStackArgs; ++i) {
         // Check if this write location is within the allocated stack.
         // pArgWriter points to the start of the current argument slot.
@@ -257,130 +253,144 @@ void* PrepareStackForApiCall(
     else {
         std::cout << "  No stack arguments were provided for the API call." << std::endl;
     }
-
     return (void*)finalRspVal;
+}
+
+/**
+ * @brief Runs a test of hijacking a thread to call a specified API.
+ *
+ * @param testName A descriptive name for the test.
+ * @param apiToCall FARPROC address of the API function to call.
+ * @param arg1 Value for RCX.
+ * @param arg2 Value for RDX.
+ * @param arg3 Value for R8.
+ * @param arg4 Value for R9.
+ * @param stackArgs Vector of DWORD64s for stack-passed arguments (5th onwards).
+ * @param pExitThreadAddress FARPROC address of ExitThread (or similar cleanup function).
+ * @param postExecutionMessage Optional message to print after successful execution.
+ */
+void RunApiTest(
+    const std::string& testName,
+    FARPROC apiToCall,
+    DWORD64 arg1, DWORD64 arg2, DWORD64 arg3, DWORD64 arg4,
+    const std::vector<DWORD64>& stackArgs,
+    FARPROC pExitThreadAddress,
+    const std::string& postExecutionMessage = ""
+) {
+    std::cout << "\n--- TESTING " << testName << " ---" << std::endl;
+    if (!apiToCall) {
+        std::cerr << "RunApiTest (" << testName << "): ERROR - apiToCall is NULL." << std::endl;
+        std::cout << "--- " << testName << " Test SKIPPED ---\n" << std::endl;
+        return;
+    }
+    if (!pExitThreadAddress) {
+        std::cerr << "RunApiTest (" << testName << "): ERROR - pExitThreadAddress is NULL." << std::endl;
+        std::cout << "--- " << testName << " Test SKIPPED ---\n" << std::endl;
+        return;
+    }
+
+    HANDLE hThread = CreateThread(NULL, 0, DummyThreadProc, NULL, CREATE_SUSPENDED, NULL);
+    if (!hThread) {
+        std::cerr << "RunApiTest (" << testName << "): ERROR - CreateThread failed: " << GetLastError() << std::endl;
+        std::cout << "--- " << testName << " Test FAILED ---\n" << std::endl;
+        return;
+    }
+    std::cout << "Created suspended thread for " << testName << "." << std::endl;
+
+    HijackContext ctx;
+    ctx.targetApiAddress = apiToCall;
+    ctx.arg1_rcx = arg1;
+    ctx.arg2_rdx = arg2;
+    ctx.arg3_r8 = arg3;
+    ctx.arg4_r9 = arg4;
+
+    void* stackAllocationBase = nullptr;
+    ctx.pPreparedStackTop = PrepareStackForApiCall(stackArgs, pExitThreadAddress, &stackAllocationBase);
+
+    if (!ctx.pPreparedStackTop) {
+        std::cerr << "RunApiTest (" << testName << "): ERROR - Failed to prepare stack." << std::endl;
+        ResumeThread(hThread); TerminateThread(hThread, 1); // Attempt cleanup
+    }
+    else {
+        if (ExecuteApiViaSetThreadContext(hThread, ctx)) {
+            std::cout << "SetThreadContext for " << testName << " successful. Resuming..." << std::endl;
+            if (ResumeThread(hThread) == (DWORD)-1) {
+                std::cerr << "RunApiTest (" << testName << "): ERROR - ResumeThread failed: " << GetLastError() << std::endl;
+            }
+            else {
+                WaitForSingleObject(hThread, INFINITE); // Wait for ExitThread
+                std::cout << testName << " thread exited." << std::endl;
+                if (!postExecutionMessage.empty()) {
+                    std::cout << postExecutionMessage << std::endl;
+                }
+            }
+        }
+        else {
+            std::cerr << "RunApiTest (" << testName << "): ERROR - ExecuteApiViaSetThreadContext failed." << std::endl;
+            ResumeThread(hThread); TerminateThread(hThread, 1); // Attempt cleanup
+        }
+    }
+
+    CloseHandle(hThread);
+    if (stackAllocationBase) {
+        VirtualFree(stackAllocationBase, 0, MEM_RELEASE);
+        DEBUG_COUT("Freed stack for " << testName << "." << std::endl);
+    }
+    std::cout << "--- " << testName << " Test Complete ---\n" << std::endl;
 }
 
 int main() {
     // --- Common Setup ---
-    // Ensure necessary DLLs are loaded if functions are not from kernel32 by default.
     LoadLibraryA("user32.dll"); // For MessageBoxA
 
     FARPROC pExitThread = GetProcAddress(GetModuleHandleA("kernel32.dll"), "ExitThread");
     if (!pExitThread) {
-        std::cerr << "main: ERROR - Failed to get ExitThread address." << std::endl;
+        std::cerr << "main: ERROR - Failed to get ExitThread address. Cannot run tests." << std::endl;
         return 1;
     }
 
-    // --- Test 1: MessageBoxA (4 register arguments, 0 stack arguments) ---
-    std::cout << "\n--- TESTING MessageBoxA ---" << std::endl;
+    // --- Define and Run Tests ---
+
+    // Test 1: MessageBoxA
     FARPROC pMessageBoxA = GetProcAddress(GetModuleHandleA("user32.dll"), "MessageBoxA");
-    if (!pMessageBoxA) {
-        std::cerr << "main: ERROR - Failed to get MessageBoxA address." << std::endl;
-    }
-    else {
-        HANDLE hThreadMsgBox = CreateThread(NULL, 0, DummyThreadProc, NULL, CREATE_SUSPENDED, NULL);
-        if (!hThreadMsgBox) {
-            std::cerr << "main: ERROR - CreateThread for MessageBoxA failed: " << GetLastError() << std::endl;
-        }
-        else {
-            std::cout << "Created suspended thread for MessageBoxA." << std::endl;
+    RunApiTest(
+        "MessageBoxA",
+        pMessageBoxA,
+        (DWORD64)NULL,                                  // HWND hWnd
+        (DWORD64)"Hello via Hijack (Test Main)!",      // LPCSTR lpText
+        (DWORD64)"SetThreadContext Demo",              // LPCSTR lpCaption
+        (DWORD64)MB_OK | MB_ICONINFORMATION,           // UINT uType
+        {},                                             // No stack arguments
+        pExitThread
+    );
 
-            HijackContext ctxMsgBox;
-            ctxMsgBox.targetApiAddress = pMessageBoxA;
-            ctxMsgBox.arg1_rcx = (DWORD64)NULL;                           // HWND hWnd
-            ctxMsgBox.arg2_rdx = (DWORD64)"Hello via Hijack (Test 1)!";   // LPCSTR lpText
-            ctxMsgBox.arg3_r8 = (DWORD64)"SetThreadContext Demo";       // LPCSTR lpCaption
-            ctxMsgBox.arg4_r9 = (DWORD64)MB_OK | MB_ICONINFORMATION;    // UINT uType
-
-            void* stackAllocMsgBox = nullptr;
-            std::vector<DWORD64> stackArgsMsgBox; // No stack arguments for MessageBoxA
-            ctxMsgBox.pPreparedStackTop = PrepareStackForApiCall(stackArgsMsgBox, pExitThread, &stackAllocMsgBox);
-
-            if (!ctxMsgBox.pPreparedStackTop) {
-                std::cerr << "main: ERROR - Failed to prepare stack for MessageBoxA." << std::endl;
-                ResumeThread(hThreadMsgBox); TerminateThread(hThreadMsgBox, 1);
-            }
-            else {
-                if (ExecuteApiViaSetThreadContext(hThreadMsgBox, ctxMsgBox)) {
-                    std::cout << "SetThreadContext for MessageBoxA successful. Resuming..." << std::endl;
-                    ResumeThread(hThreadMsgBox);
-                    WaitForSingleObject(hThreadMsgBox, INFINITE); // Wait for ExitThread
-                    std::cout << "MessageBoxA thread exited." << std::endl;
-                }
-                else {
-                    std::cerr << "main: ERROR - ExecuteApiViaSetThreadContext for MessageBoxA failed." << std::endl;
-                    ResumeThread(hThreadMsgBox); TerminateThread(hThreadMsgBox, 1);
-                }
-            }
-            CloseHandle(hThreadMsgBox);
-            if (stackAllocMsgBox) {
-                VirtualFree(stackAllocMsgBox, 0, MEM_RELEASE);
-                DEBUG_COUT("Freed stack for MessageBoxA." << std::endl);
-            }
-        }
-    }
-    std::cout << "--- MessageBoxA Test Complete ---\n" << std::endl;
-
-
-    // --- Test 2: CreateFileA (4 register arguments, 3 stack arguments) ---
-    std::cout << "--- TESTING CreateFileA ---" << std::endl;
+    // Test 2: CreateFileA
     FARPROC pCreateFileA = GetProcAddress(GetModuleHandleA("kernel32.dll"), "CreateFileA");
-    if (!pCreateFileA) {
-        std::cerr << "main: ERROR - Failed to get CreateFileA address." << std::endl;
-    }
-    else {
-        HANDLE hThreadCreateFile = CreateThread(NULL, 0, DummyThreadProc, NULL, CREATE_SUSPENDED, NULL);
-        if (!hThreadCreateFile) {
-            std::cerr << "main: ERROR - CreateThread for CreateFileA failed: " << GetLastError() << std::endl;
-        }
-        else {
-            std::cout << "Created suspended thread for CreateFileA." << std::endl;
+    const char* testFileName = "C:\\temp\\hijack_test_file.txt"; // Ensure C:\temp is writable
+    std::vector<DWORD64> stackArgsCreateFile;
+    stackArgsCreateFile.push_back((DWORD64)CREATE_ALWAYS);          // 5th: dwCreationDisposition
+    stackArgsCreateFile.push_back((DWORD64)FILE_ATTRIBUTE_NORMAL);  // 6th: dwFlagsAndAttributes
+    stackArgsCreateFile.push_back((DWORD64)NULL);                   // 7th: hTemplateFile
 
-            HijackContext ctxCreateFile;
-            ctxCreateFile.targetApiAddress = pCreateFileA;
+    RunApiTest(
+        "CreateFileA",
+        pCreateFileA,
+        (DWORD64)testFileName,                          // lpFileName
+        GENERIC_WRITE | GENERIC_READ,                   // dwDesiredAccess
+        FILE_SHARE_READ,                                // dwShareMode
+        (DWORD64)NULL,                                  // lpSecurityAttributes
+        stackArgsCreateFile,
+        pExitThread,
+        "VERIFY: Check if '" + std::string(testFileName) + "' was created."
+    );
 
-            const char* testFileName = "C:\\temp\\hijack_test_file.txt"; // Ensure C:\temp is writable
-            ctxCreateFile.arg1_rcx = (DWORD64)testFileName;                 // lpFileName
-            ctxCreateFile.arg2_rdx = GENERIC_WRITE | GENERIC_READ;          // dwDesiredAccess
-            ctxCreateFile.arg3_r8 = FILE_SHARE_READ;                       // dwShareMode
-            ctxCreateFile.arg4_r9 = (DWORD64)NULL;                         // lpSecurityAttributes
+    // Add more tests here if needed...
+    // Example: Test with another API, perhaps one that takes no arguments to test the simplest case.
+    // FARPROC pGetTickCount = GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetTickCount");
+    // RunApiTest("GetTickCount", pGetTickCount, 0,0,0,0, {}, pExitThread, "GetTickCount called (no output to verify).");
 
-            std::vector<DWORD64> stackArgsCreateFile;
-            stackArgsCreateFile.push_back((DWORD64)CREATE_ALWAYS);          // 5th: dwCreationDisposition
-            stackArgsCreateFile.push_back((DWORD64)FILE_ATTRIBUTE_NORMAL);  // 6th: dwFlagsAndAttributes
-            stackArgsCreateFile.push_back((DWORD64)NULL);                   // 7th: hTemplateFile
-
-            void* stackAllocCreateFile = nullptr;
-            ctxCreateFile.pPreparedStackTop = PrepareStackForApiCall(stackArgsCreateFile, pExitThread, &stackAllocCreateFile);
-
-            if (!ctxCreateFile.pPreparedStackTop) {
-                std::cerr << "main: ERROR - Failed to prepare stack for CreateFileA." << std::endl;
-                ResumeThread(hThreadCreateFile); TerminateThread(hThreadCreateFile, 1);
-            }
-            else {
-                if (ExecuteApiViaSetThreadContext(hThreadCreateFile, ctxCreateFile)) {
-                    std::cout << "SetThreadContext for CreateFileA successful. Resuming..." << std::endl;
-                    ResumeThread(hThreadCreateFile);
-                    WaitForSingleObject(hThreadCreateFile, INFINITE); // Wait for ExitThread
-                    std::cout << "CreateFileA thread exited." << std::endl;
-                    std::cout << "VERIFY: Check if '" << testFileName << "' was created." << std::endl;
-                }
-                else {
-                    std::cerr << "main: ERROR - ExecuteApiViaSetThreadContext for CreateFileA failed." << std::endl;
-                    ResumeThread(hThreadCreateFile); TerminateThread(hThreadCreateFile, 1);
-                }
-            }
-            CloseHandle(hThreadCreateFile);
-            if (stackAllocCreateFile) {
-                VirtualFree(stackAllocCreateFile, 0, MEM_RELEASE);
-                DEBUG_COUT("Freed stack for CreateFileA." << std::endl);
-            }
-        }
-    }
-    std::cout << "--- CreateFileA Test Complete ---" << std::endl;
 
     std::cout << "\nAll tests finished. Press any key to close..." << std::endl;
-    std::cin.get(); // Keep console open
+    std::cin.get();
     return 0;
 }
