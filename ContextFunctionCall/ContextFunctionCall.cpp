@@ -1,192 +1,227 @@
 #include <windows.h>
-#include <iostream> // For error messages
-#include <vector>   // For HijackContext if it were to hold dynamic stack args
+#include <iostream> // For std::cerr and std::cout
+#include <vector>   // For std::vector
+#include <cstdio>   // For printf (used in debug prints)
 
-// Context provided by the caller
+// Define a preprocessor macro for debug prints
+#ifdef _DEBUG
+#define DEBUG_PRINTF(...) printf(__VA_ARGS__)
+#define DEBUG_COUT(x) std::cout << x
+#else
+#define DEBUG_PRINTF(...) do {} while (0)
+#define DEBUG_COUT(x) do {} while (0)
+#endif
+
+/**
+ * @brief Context structure for preparing an API call via SetThreadContext.
+ *
+ * This structure holds all necessary information to set up the target thread's
+ * context to call a specified WinAPI function with given arguments.
+ */
 struct HijackContext {
-    FARPROC targetApiAddress;
-    DWORD64 arg1_rcx;
-    DWORD64 arg2_rdx;
-    DWORD64 arg3_r8;
-    DWORD64 arg4_r9;
-    void* pPreparedStackTop; // This is the RSP for the target API. Must be (16*N)+8 aligned.
-    // It points to the "return address" for targetApiAddress.
+    FARPROC targetApiAddress;   ///< Address of the WinAPI function to be called.
+    DWORD64 arg1_rcx;           ///< Value for the RCX register (1st integer/pointer argument).
+    DWORD64 arg2_rdx;           ///< Value for the RDX register (2nd integer/pointer argument).
+    DWORD64 arg3_r8;            ///< Value for the R8 register (3rd integer/pointer argument).
+    DWORD64 arg4_r9;            ///< Value for the R9 register (4th integer/pointer argument).
+
+    /**
+     * @brief Pointer to the top of the prepared stack for the target API.
+     * This address will become the new RSP (Stack Pointer) for the target thread.
+     * It MUST be (16*N)+8 aligned as per x64 calling convention (RSP points to the return address,
+     * and after a CALL, RSP is (16*N)+8; SetThreadContext bypasses CALL, so RSP itself must meet this).
+     * The memory this RSP points to must contain the return address for the targetApiAddress.
+     */
+    void* pPreparedStackTop;
 };
 
+/**
+ * @brief Modifies the context of a suspended thread to execute a target API call.
+ *
+ * @param hThread A handle to the suspended thread whose context will be modified.
+ * @param context A HijackContext structure containing the API address, arguments, and prepared stack pointer.
+ * @return true if the thread context was successfully set, false otherwise.
+ *
+ * The caller is responsible for resuming the thread and subsequent cleanup.
+ */
 bool ExecuteApiViaSetThreadContext(
     HANDLE hThread,
     const HijackContext& context)
 {
     if (!hThread || !context.targetApiAddress || !context.pPreparedStackTop) {
         SetLastError(ERROR_INVALID_PARAMETER);
-        std::cerr << "ExecuteApiViaSetThreadContext: Invalid parameters." << std::endl;
+        std::cerr << "ExecuteApiViaSetThreadContext: ERROR - Invalid parameters." << std::endl;
         return false;
     }
 
-    // Validate pPreparedStackTop alignment (RSP must be (16*N)+8)
+    // x64 Calling Convention Requirement: RSP must be (16*N)+8 when a function is entered.
+    // Here, context.pPreparedStackTop will become the new RSP and points to the return address.
     if (((DWORD64)context.pPreparedStackTop % 16) != 8) {
         SetLastError(ERROR_INVALID_PARAMETER);
-        std::cerr << "ExecuteApiViaSetThreadContext: pPreparedStackTop (new RSP) is not (16*N)+8 aligned. RSP: "
+        std::cerr << "ExecuteApiViaSetThreadContext: ERROR - pPreparedStackTop (new RSP) is not (16*N)+8 aligned. RSP: "
             << context.pPreparedStackTop << std::endl;
         return false;
     }
 
     CONTEXT threadContext;
-    threadContext.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER; // We need control and integer registers
+    threadContext.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER; // We'll modify control and integer registers.
 
     if (!GetThreadContext(hThread, &threadContext)) {
-        std::cerr << "ExecuteApiViaSetThreadContext: GetThreadContext failed. Error: " << GetLastError() << std::endl;
-        // Note: Do not TerminateThread here, let the caller decide how to handle the suspended thread.
+        std::cerr << "ExecuteApiViaSetThreadContext: ERROR - GetThreadContext failed. Error: " << GetLastError() << std::endl;
         return false;
     }
 
-    // Set Instruction Pointer
+    // Set Instruction Pointer to the target API function.
     threadContext.Rip = (DWORD64)context.targetApiAddress;
 
-    // Set Register Arguments
+    // Set Register Arguments (first four integer/pointer arguments).
     threadContext.Rcx = context.arg1_rcx;
     threadContext.Rdx = context.arg2_rdx;
     threadContext.R8 = context.arg3_r8;
     threadContext.R9 = context.arg4_r9;
 
-    // Set Stack Pointer
+    // Set Stack Pointer to the top of the pre-prepared stack.
     threadContext.Rsp = (DWORD64)context.pPreparedStackTop;
 
-    // Set Base Pointer (RBP)
-    // Often RBP is set to RSP at the start of a function if it creates a new stack frame.
-    // Or it can point to the base of the allocated stack region.
-    // For simplicity and because the API will manage its own RBP if needed,
-    // setting it to RSP is a common safe choice for this kind of hijack.
-    threadContext.Rbp = threadContext.Rsp; // Or a more meaningful base if the API expects it (unlikely for standard WinAPIs this way)
+    // Set Base Pointer (RBP).
+    // For a hijacked call where the target API is entered directly, setting RBP to RSP
+    // is a common and generally safe approach. The API will establish its own frame if needed.
+    threadContext.Rbp = threadContext.Rsp;
 
-
-    // Set the modified context
-    // ContextFlags should only include bits for registers you actually changed and want to set.
-    // We changed RIP, RCX, RDX, R8, R9, RSP, RBP.
-    threadContext.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+    // Apply the modified context to the thread.
+    // Ensure ContextFlags reflects all registers that were changed.
     if (!SetThreadContext(hThread, &threadContext)) {
-        std::cerr << "ExecuteApiViaSetThreadContext: SetThreadContext failed. Error: " << GetLastError() << std::endl;
+        std::cerr << "ExecuteApiViaSetThreadContext: ERROR - SetThreadContext failed. Error: " << GetLastError() << std::endl;
         return false;
     }
-
-    // Resuming the thread is up to the caller, as is waiting and cleanup.
-    // This function's job is just to set the context.
 
     return true;
 }
 
-// --- Example Usage (Illustrative - Caller's Responsibility) ---
+/**
+ * @brief A dummy thread procedure to keep a thread alive until it's hijacked or terminated.
+ */
 DWORD WINAPI DummyThreadProc(LPVOID lpParameter) {
-    Sleep(INFINITE); // Keep thread alive
+    UNREFERENCED_PARAMETER(lpParameter);
+    Sleep(INFINITE);
     return 0;
 }
 
-#include <cstdio> // For printf
-
-// Helper to allocate an aligned stack and prepare it
-// Returns the RSP value to be used, or nullptr on failure.
-// The caller is responsible for VirtualFree(stackAllocationBase, 0, MEM_RELEASE);
+/**
+ * @brief Prepares a new stack for a target API call according to the x64 calling convention.
+ *
+ * This function allocates memory for a new stack, calculates the correct RSP value (which will
+ * point to the return address for the API), and places the API's stack-passed arguments
+ * (5th argument onwards) at the correct offsets from this RSP.
+ *
+ * x64 Calling Convention Stack Layout (when API is entered, RSP points to Return Address):
+ * [RSP+0x00]: Return Address (e.g., address of ExitThread)
+ * [RSP+0x08]: Shadow space for RCX (callee can use)
+ * [RSP+0x10]: Shadow space for RDX
+ * [RSP+0x18]: Shadow space for R8
+ * [RSP+0x20]: Shadow space for R9
+ * [RSP+0x28]: 5th argument (if any)
+ * [RSP+0x30]: 6th argument (if any)
+ * ...
+ * The RSP value itself must be (16*N)+8 aligned.
+ *
+ * @param stackArgs_in_order A vector of DWORD64 values representing the 5th, 6th, ... arguments
+ *                           for the target API, in their natural call order.
+ * @param pRetAddressForApi The address the target API should return to (e.g., ExitThread).
+ * @param outStackAllocationBase Pointer to a void* that will receive the base address of the
+ *                               VirtualAlloc'd stack region, so the caller can free it later.
+ * @return A void* pointer to the calculated RSP value for the new stack, or nullptr on failure.
+ *         This RSP value will point to pRetAddressForApi on the new stack.
+ */
 void* PrepareStackForApiCall(
-    const std::vector<DWORD64>& stackArgs_in_order, // 5th, 6th... args in order
-    FARPROC pRetAddressForApi,                      // e.g., ExitThread address
-    void** outStackAllocationBase                   // To store the base for later freeing
+    const std::vector<DWORD64>& stackArgs_in_order,
+    FARPROC pRetAddressForApi,
+    void** outStackAllocationBase
 ) {
     if (!pRetAddressForApi || !outStackAllocationBase) {
-        std::cerr << "PrepareStackForApiCall: Null pRetAddressForApi or outStackAllocationBase." << std::endl;
+        std::cerr << "PrepareStackForApiCall: ERROR - Null pRetAddressForApi or outStackAllocationBase." << std::endl;
         return nullptr;
     }
 
-    const size_t shadowSpaceSize = 32;
-    const size_t retAddrSize = 8;
-    size_t numStackArgs = stackArgs_in_order.size();
-    size_t totalStackArgsSize = numStackArgs * 8;
+    // Constants for x64 calling convention stack layout.
+    const size_t shadowSpaceSize = 32; // 4 QWORDS for RCX, RDX, R8, R9 spill by callee
+    const size_t retAddrSlotSize = 8;  // Size of the return address on stack
+    const size_t firstStackArgOffset = 0x28; // Offset from RSP to the 5th argument
 
-    // Determine allocation size
-    SIZE_T allocationSize = 65536; // Default 64KB
-    SIZE_T minRequiredForData = totalStackArgsSize + shadowSpaceSize + retAddrSize + 16 /*alignment margin*/;
-    if (allocationSize < minRequiredForData) {
-        allocationSize = minRequiredForData + 1024; // Ensure enough space if minRequired is larger
-        std::cout << "  INFO: Increased allocationSize to " << allocationSize << " due to argument data size." << std::endl;
+    size_t numStackArgs = stackArgs_in_order.size();
+    size_t totalStackArgsSizeBytes = numStackArgs * sizeof(DWORD64);
+
+    // Determine allocation size for the new stack.
+    // Needs to be large enough for return address, shadow space, all stack arguments,
+    // plus ample space for the target API's own local variables and any functions it might call.
+    SIZE_T allocationSize = 65536; // Default 64KB, generally sufficient for many APIs.
+    SIZE_T minRequiredForOurData = retAddrSlotSize + shadowSpaceSize + totalStackArgsSizeBytes + 16 /*alignment margin*/;
+    if (allocationSize < minRequiredForOurData) {
+        allocationSize = minRequiredForOurData + 4096; // Add an extra page if minRequired is large
+        DEBUG_COUT("  INFO: Increased allocationSize to " << allocationSize << " due to argument data size." << std::endl);
     }
 
     void* stackBase = VirtualAlloc(NULL, allocationSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!stackBase) {
-        std::cerr << "PrepareStackForApiCall: VirtualAlloc failed. Error: " << GetLastError() << std::endl;
+        std::cerr << "PrepareStackForApiCall: ERROR - VirtualAlloc failed. Error: " << GetLastError() << std::endl;
         return nullptr;
     }
-    *outStackAllocationBase = stackBase;
+    *outStackAllocationBase = stackBase; // Return base for freeing
 
-    std::cout << "  DEBUG: stackBase = " << stackBase
-        << ", allocationSize = " << allocationSize << std::endl;
+    DEBUG_COUT("  DEBUG: PrepareStackForApiCall - stackBase = " << stackBase
+        << ", allocationSize = " << allocationSize << std::endl);
 
-    // --- Calculate finalRspVal ---
-    // This logic determines where RSP will be. It needs to be (16*N)+8.
-    // It's based on placing the arguments and return address starting from the *top* of the allocated stack.
+    // --- Calculate the finalRspVal (the RSP the target API will receive) ---
+    // The goal is to determine an RSP that is (16*N)+8 aligned and correctly positions
+    // the return address, shadow space, and stack arguments.
+    // We calculate it based on a conceptual layout starting from the top of our allocated stack.
 
-    // Tentative top of stack where we start writing downwards
-    char* pCurrentWriter_for_rsp_calc = (char*)stackBase + allocationSize;
+    char* pStackHighWatermark = (char*)stackBase + allocationSize; // Highest address + 1 in our block
 
-    // Simulate pushing stack arguments to find the address of the 5th argument slot
-    char* pTentative_Addr_5th_Arg = pCurrentWriter_for_rsp_calc - (numStackArgs * 8);
-    // Note: If numStackArgs is 0, pTentative_Addr_5th_Arg is pCurrentWriter_for_rsp_calc.
-    // The "5th arg slot" is still conceptually relevant for shadow space placement.
+    // Tentatively, where would the 5th argument be if all stack args were packed at the top?
+    char* pTentative_Addr_5th_Arg_Slot = pStackHighWatermark - totalStackArgsSizeBytes;
+    // This points to where the 5th argument would *start*.
 
-    // pProspectiveRsp is where the return address would notionally go, relative to the 5th arg slot
-    char* pProspectiveRsp = pTentative_Addr_5th_Arg - shadowSpaceSize - retAddrSize;
+    // pProspectiveRsp is the unaligned RSP if the return address slot were placed directly
+    // below the shadow space, which itself is below the 5th argument slot.
+    char* pProspectiveRsp = pTentative_Addr_5th_Arg_Slot - shadowSpaceSize - retAddrSlotSize;
 
-    std::cout << "  DEBUG: pCurrentWriter_for_rsp_calc (initial top) = " << (void*)pCurrentWriter_for_rsp_calc << std::endl;
-    if (numStackArgs > 0) {
-        std::cout << "  DEBUG: pTentative_Addr_5th_Arg (if stack args were pushed from top) = " << (void*)pTentative_Addr_5th_Arg << std::endl;
-    }
-    else {
-        std::cout << "  DEBUG: No stack args, pTentative_Addr_5th_Arg conceptually at " << (void*)pTentative_Addr_5th_Arg << std::endl;
-    }
-    std::cout << "  DEBUG: pProspectiveRsp (unaligned RSP target) = " << (void*)pProspectiveRsp << std::endl;
+    DEBUG_COUT("  DEBUG: pStackHighWatermark (initial top for calc) = " << (void*)pStackHighWatermark << std::endl);
+    DEBUG_COUT("  DEBUG: pTentative_Addr_5th_Arg_Slot (if args pushed from top) = " << (void*)pTentative_Addr_5th_Arg_Slot << std::endl);
+    DEBUG_COUT("  DEBUG: pProspectiveRsp (unaligned RSP target) = " << (void*)pProspectiveRsp << std::endl);
 
+    // Align pProspectiveRsp downwards to be (16*N)+8. This is the final RSP.
+    DWORD64 finalRspVal = ((DWORD64)pProspectiveRsp - 8ULL) & ~15ULL; // Aligns (value - 8) down to a multiple of 16
+    finalRspVal += 8ULL;                                             // Add 8 back to get (16*N) + 8
 
-    // Align pProspectiveRsp downwards to (16*N)+8 to get finalRspVal
-    DWORD64 step1_prospectiveRsp_val64 = (DWORD64)pProspectiveRsp;
-    // std::cout << "  DEBUG: step1_prospectiveRsp_val64 = " << (void*)step1_prospectiveRsp_val64 << std::endl; // Redundant with above
+    DEBUG_COUT("  DEBUG: finalRspVal (calculated and aligned RSP) = " << (void*)finalRspVal << std::endl);
 
-    const DWORD64 eight_64 = 8ULL;
-    DWORD64 step2_minus_8 = step1_prospectiveRsp_val64 - eight_64;
-    // std::cout << "  DEBUG: step2_minus_8 = " << (void*)step2_minus_8 << std::endl;
-
-    const DWORD64 fifteen_val_64 = 15ULL;
-    const DWORD64 mask_complement_64 = ~fifteen_val_64;
-    // printf("  DEBUG: mask_complement_64 (hex): %016llX\n", mask_complement_64);
-
-    DWORD64 step3_anded_val = step2_minus_8 & mask_complement_64;
-    // std::cout << "  DEBUG: step3_anded_val = " << (void*)step3_anded_val << std::endl;
-
-    DWORD64 finalRspVal = step3_anded_val + eight_64;
-    std::cout << "  DEBUG: finalRspVal (calculated and aligned RSP) = " << (void*)finalRspVal << std::endl;
-
-    // Sanity check: finalRspVal must be within our allocated stack block
-    if (finalRspVal < (DWORD64)stackBase || finalRspVal >= ((DWORD64)stackBase + allocationSize)) {
-        std::cerr << "PrepareStackForApiCall: finalRspVal is outside allocated stack region after alignment." << std::endl;
+    // Sanity check: finalRspVal must be within our allocated stack block.
+    // It should point to where the return address will be.
+    if (finalRspVal < (DWORD64)stackBase || (finalRspVal + retAddrSlotSize) >((DWORD64)stackBase + allocationSize)) {
+        std::cerr << "PrepareStackForApiCall: ERROR - finalRspVal is outside allocated stack region after alignment." << std::endl;
         std::cerr << "  stackBase: " << stackBase << ", stackEnd: " << (void*)((char*)stackBase + allocationSize - 1) << std::endl;
         std::cerr << "  finalRspVal: " << (void*)finalRspVal << std::endl;
         VirtualFree(stackBase, 0, MEM_RELEASE); *outStackAllocationBase = nullptr; return nullptr;
     }
 
-    // --- Place data onto the stack relative to finalRspVal ---
+    // --- Place data onto the stack relative to the calculated finalRspVal ---
 
-    // 1. Place the return address at finalRspVal
+    // 1. Place the return address at finalRspVal.
     *(DWORD64*)finalRspVal = (DWORD64)pRetAddressForApi;
-    printf("  DEBUG: PLACED Return Address (value 0x%llX) to actual RSP %p\n",
-        (unsigned long long)pRetAddressForApi, (void*)finalRspVal);
+    DEBUG_PRINTF("  DEBUG: PLACED Return Address (value 0x%llX) to actual RSP %p\n",
+        (unsigned long long)(DWORD64)pRetAddressForApi, (void*)finalRspVal);
 
-    // 2. Place stack arguments:
-    //    5th arg goes to finalRspVal + 0x28
-    //    6th arg goes to finalRspVal + 0x30
-    //    etc.
-    char* pArgWriter = (char*)finalRspVal + 0x28; // Start of 5th argument slot
-    std::cout << "  DEBUG: Placing stack arguments relative to finalRspVal:" << std::endl;
+    // 2. Place stack arguments (5th, 6th, etc.).
+    //    The 5th argument goes to finalRspVal + firstStackArgOffset (RSP + 0x28).
+    char* pArgWriter = (char*)finalRspVal + firstStackArgOffset;
+    DEBUG_COUT("  DEBUG: Placing stack arguments relative to finalRspVal:" << std::endl);
+
     for (size_t i = 0; i < numStackArgs; ++i) {
-        // Check if this write location is within the allocated stack
-        if (((char*)pArgWriter + sizeof(DWORD64)) > ((char*)stackBase + allocationSize)) {
-            std::cerr << "PrepareStackForApiCall: About to write stack argument #" << (i + 5)
+        // Check if this write location is within the allocated stack.
+        // pArgWriter points to the start of the current argument slot.
+        if ((pArgWriter + sizeof(DWORD64)) > ((char*)stackBase + allocationSize)) {
+            std::cerr << "PrepareStackForApiCall: ERROR - About to write stack argument #" << (i + 5)
                 << " out of allocated stack bounds." << std::endl;
             std::cerr << "  pArgWriter: " << (void*)pArgWriter << ", stackEnd: "
                 << (void*)((char*)stackBase + allocationSize - 1) << std::endl;
@@ -194,29 +229,30 @@ void* PrepareStackForApiCall(
         }
 
         *(DWORD64*)pArgWriter = stackArgs_in_order[i];
-        printf("  DEBUG: PLACED arg #%zu (value 0x%llX) to address %p (RSP+0x%X)\n",
+        DEBUG_PRINTF("  DEBUG: PLACED arg #%zu (value 0x%llX) to address %p (RSP+0x%X)\n",
             i + 5, // Argument number (5th, 6th, etc.)
             (unsigned long long)stackArgs_in_order[i],
             (void*)pArgWriter,
-            (unsigned int)(0x28 + i * 8)); // Offset from RSP
-        pArgWriter += 8;
+            (unsigned int)(firstStackArgOffset + i * sizeof(DWORD64))); // Offset from RSP
+        pArgWriter += sizeof(DWORD64);
     }
 
-    // Final summary print
+    // Final summary print for the caller/debugger.
     std::cout << "Prepared stack. Final New RSP will be: " << (void*)finalRspVal
         << " (RSP % 16 = " << (finalRspVal % 16) << ")" << std::endl;
     std::cout << "  Return address for API set to: " << (void*)pRetAddressForApi << std::endl;
     if (!stackArgs_in_order.empty()) {
-        printf("  Verification: 5th arg (value 0x%llX) is at %p (RSP+0x28)\n",
-            (unsigned long long)stackArgs_in_order[0], (void*)(finalRspVal + 0x28));
+        DEBUG_PRINTF("  VERIFICATION: 5th arg (value 0x%llX) is at %p (RSP+0x%X)\n",
+            (unsigned long long)stackArgs_in_order[0],
+            (void*)(finalRspVal + firstStackArgOffset),
+            (unsigned int)firstStackArgOffset);
         if (numStackArgs > 1) {
-            printf("  Verification: 6th arg (value 0x%llX) is at %p (RSP+0x30)\n",
-                (unsigned long long)stackArgs_in_order[1], (void*)(finalRspVal + 0x30));
+            DEBUG_PRINTF("  VERIFICATION: 6th arg (value 0x%llX) is at %p (RSP+0x%X)\n",
+                (unsigned long long)stackArgs_in_order[1],
+                (void*)(finalRspVal + firstStackArgOffset + sizeof(DWORD64)),
+                (unsigned int)(firstStackArgOffset + sizeof(DWORD64)));
         }
-        if (numStackArgs > 2) {
-            printf("  Verification: 7th arg (value 0x%llX) is at %p (RSP+0x38)\n",
-                (unsigned long long)stackArgs_in_order[2], (void*)(finalRspVal + 0x38));
-        }
+        // Add more verification prints if desired.
     }
     else {
         std::cout << "  No stack arguments were provided for the API call." << std::endl;
@@ -224,127 +260,127 @@ void* PrepareStackForApiCall(
 
     return (void*)finalRspVal;
 }
-#include <string> // For std::string
-#include <algorithm> // For std::reverse, though not strictly needed for push_back
-
-// ... (HijackContext, ExecuteApiViaSetThreadContext, DummyThreadProc, PrepareStackForApiCall remain the same) ...
 
 int main() {
     // --- Common Setup ---
-    LoadLibraryA("user32.dll"); // Still good to have for MessageBoxA if we switch back
+    // Ensure necessary DLLs are loaded if functions are not from kernel32 by default.
+    LoadLibraryA("user32.dll"); // For MessageBoxA
+
     FARPROC pExitThread = GetProcAddress(GetModuleHandleA("kernel32.dll"), "ExitThread");
     if (!pExitThread) {
-        std::cerr << "Failed to get ExitThread address." << std::endl;
+        std::cerr << "main: ERROR - Failed to get ExitThread address." << std::endl;
         return 1;
     }
 
-    // --- Test 1: MessageBoxA (as before, to confirm baseline works) ---
+    // --- Test 1: MessageBoxA (4 register arguments, 0 stack arguments) ---
     std::cout << "\n--- TESTING MessageBoxA ---" << std::endl;
     FARPROC pMessageBoxA = GetProcAddress(GetModuleHandleA("user32.dll"), "MessageBoxA");
     if (!pMessageBoxA) {
-        std::cerr << "Failed to get MessageBoxA address." << std::endl;
-        return 1; // Or skip this test
-    }
-
-    HANDLE hThreadMsgBox = CreateThread(NULL, 0, DummyThreadProc, NULL, CREATE_SUSPENDED, NULL);
-    if (!hThreadMsgBox) {
-        std::cerr << "CreateThread for MessageBoxA failed: " << GetLastError() << std::endl;
-        return 1;
-    }
-    std::cout << "Created suspended thread for MessageBoxA." << std::endl;
-
-    HijackContext ctxMsgBox;
-    ctxMsgBox.targetApiAddress = pMessageBoxA;
-    ctxMsgBox.arg1_rcx = (DWORD64)NULL;
-    ctxMsgBox.arg2_rdx = (DWORD64)"Hello via Hijack (Test 1)!";
-    ctxMsgBox.arg3_r8 = (DWORD64)"SetThreadContext Demo";
-    ctxMsgBox.arg4_r9 = (DWORD64)MB_OK | MB_ICONINFORMATION;
-
-    void* stackAllocMsgBox = nullptr;
-    std::vector<DWORD64> stackArgsMsgBox; // Empty
-    ctxMsgBox.pPreparedStackTop = PrepareStackForApiCall(stackArgsMsgBox, pExitThread, &stackAllocMsgBox);
-
-    if (!ctxMsgBox.pPreparedStackTop) {
-        std::cerr << "Failed to prepare stack for MessageBoxA." << std::endl;
-        ResumeThread(hThreadMsgBox); TerminateThread(hThreadMsgBox, 1); CloseHandle(hThreadMsgBox);
+        std::cerr << "main: ERROR - Failed to get MessageBoxA address." << std::endl;
     }
     else {
-        if (ExecuteApiViaSetThreadContext(hThreadMsgBox, ctxMsgBox)) {
-            std::cout << "SetThreadContext for MessageBoxA successful. Resuming..." << std::endl;
-            ResumeThread(hThreadMsgBox);
-            WaitForSingleObject(hThreadMsgBox, INFINITE);
-            std::cout << "MessageBoxA thread exited." << std::endl;
+        HANDLE hThreadMsgBox = CreateThread(NULL, 0, DummyThreadProc, NULL, CREATE_SUSPENDED, NULL);
+        if (!hThreadMsgBox) {
+            std::cerr << "main: ERROR - CreateThread for MessageBoxA failed: " << GetLastError() << std::endl;
         }
         else {
-            std::cerr << "ExecuteApiViaSetThreadContext for MessageBoxA failed." << std::endl;
-            ResumeThread(hThreadMsgBox); TerminateThread(hThreadMsgBox, 1);
+            std::cout << "Created suspended thread for MessageBoxA." << std::endl;
+
+            HijackContext ctxMsgBox;
+            ctxMsgBox.targetApiAddress = pMessageBoxA;
+            ctxMsgBox.arg1_rcx = (DWORD64)NULL;                           // HWND hWnd
+            ctxMsgBox.arg2_rdx = (DWORD64)"Hello via Hijack (Test 1)!";   // LPCSTR lpText
+            ctxMsgBox.arg3_r8 = (DWORD64)"SetThreadContext Demo";       // LPCSTR lpCaption
+            ctxMsgBox.arg4_r9 = (DWORD64)MB_OK | MB_ICONINFORMATION;    // UINT uType
+
+            void* stackAllocMsgBox = nullptr;
+            std::vector<DWORD64> stackArgsMsgBox; // No stack arguments for MessageBoxA
+            ctxMsgBox.pPreparedStackTop = PrepareStackForApiCall(stackArgsMsgBox, pExitThread, &stackAllocMsgBox);
+
+            if (!ctxMsgBox.pPreparedStackTop) {
+                std::cerr << "main: ERROR - Failed to prepare stack for MessageBoxA." << std::endl;
+                ResumeThread(hThreadMsgBox); TerminateThread(hThreadMsgBox, 1);
+            }
+            else {
+                if (ExecuteApiViaSetThreadContext(hThreadMsgBox, ctxMsgBox)) {
+                    std::cout << "SetThreadContext for MessageBoxA successful. Resuming..." << std::endl;
+                    ResumeThread(hThreadMsgBox);
+                    WaitForSingleObject(hThreadMsgBox, INFINITE); // Wait for ExitThread
+                    std::cout << "MessageBoxA thread exited." << std::endl;
+                }
+                else {
+                    std::cerr << "main: ERROR - ExecuteApiViaSetThreadContext for MessageBoxA failed." << std::endl;
+                    ResumeThread(hThreadMsgBox); TerminateThread(hThreadMsgBox, 1);
+                }
+            }
+            CloseHandle(hThreadMsgBox);
+            if (stackAllocMsgBox) {
+                VirtualFree(stackAllocMsgBox, 0, MEM_RELEASE);
+                DEBUG_COUT("Freed stack for MessageBoxA." << std::endl);
+            }
         }
     }
-    CloseHandle(hThreadMsgBox);
-    if (stackAllocMsgBox) VirtualFree(stackAllocMsgBox, 0, MEM_RELEASE);
     std::cout << "--- MessageBoxA Test Complete ---\n" << std::endl;
 
 
-    // --- Test 2: CreateFileA (7 parameters) ---
+    // --- Test 2: CreateFileA (4 register arguments, 3 stack arguments) ---
     std::cout << "--- TESTING CreateFileA ---" << std::endl;
     FARPROC pCreateFileA = GetProcAddress(GetModuleHandleA("kernel32.dll"), "CreateFileA");
     if (!pCreateFileA) {
-        std::cerr << "Failed to get CreateFileA address." << std::endl;
-        return 1;
-    }
-
-    HANDLE hThreadCreateFile = CreateThread(NULL, 0, DummyThreadProc, NULL, CREATE_SUSPENDED, NULL);
-    if (!hThreadCreateFile) {
-        std::cerr << "CreateThread for CreateFileA failed: " << GetLastError() << std::endl;
-        return 1;
-    }
-    std::cout << "Created suspended thread for CreateFileA." << std::endl;
-
-    HijackContext ctxCreateFile;
-    ctxCreateFile.targetApiAddress = pCreateFileA;
-
-    // Arguments for CreateFileA:
-    const char* testFileName = "C:\\temp\\hijack_test_file.txt"; // Make sure this path is writable
-    ctxCreateFile.arg1_rcx = (DWORD64)testFileName;          // lpFileName
-    ctxCreateFile.arg2_rdx = GENERIC_WRITE | GENERIC_READ;   // dwDesiredAccess
-    ctxCreateFile.arg3_r8 = FILE_SHARE_READ;                // dwShareMode
-    ctxCreateFile.arg4_r9 = (DWORD64)NULL;                  // lpSecurityAttributes
-
-    // Stack arguments (5th, 6th, 7th)
-    std::vector<DWORD64> stackArgsCreateFile;
-    stackArgsCreateFile.push_back((DWORD64)CREATE_ALWAYS);       // 5th: dwCreationDisposition
-    stackArgsCreateFile.push_back((DWORD64)FILE_ATTRIBUTE_NORMAL); // 6th: dwFlagsAndAttributes
-    stackArgsCreateFile.push_back((DWORD64)NULL);                // 7th: hTemplateFile
-
-    void* stackAllocCreateFile = nullptr;
-    // PrepareStackForApiCall expects arguments in order (5th, then 6th, then 7th).
-    // It will reverse them internally for pushing onto the stack.
-    ctxCreateFile.pPreparedStackTop = PrepareStackForApiCall(stackArgsCreateFile, pExitThread, &stackAllocCreateFile);
-
-    if (!ctxCreateFile.pPreparedStackTop) {
-        std::cerr << "Failed to prepare stack for CreateFileA." << std::endl;
-        ResumeThread(hThreadCreateFile); TerminateThread(hThreadCreateFile, 1); CloseHandle(hThreadCreateFile);
+        std::cerr << "main: ERROR - Failed to get CreateFileA address." << std::endl;
     }
     else {
-        if (ExecuteApiViaSetThreadContext(hThreadCreateFile, ctxCreateFile)) {
-            std::cout << "SetThreadContext for CreateFileA successful. Resuming..." << std::endl;
-            ResumeThread(hThreadCreateFile);
-            WaitForSingleObject(hThreadCreateFile, INFINITE);
-            std::cout << "CreateFileA thread exited." << std::endl;
-            std::cout << "Check if '" << testFileName << "' was created (and then delete it manually)." << std::endl;
-            // Note: If the file is created, it might be left open if the thread exits abruptly
-            // before any internal cleanup by CreateFileA happens, or if ExitThread is too harsh.
-            // However, since ExitThread is the 'return', the OS should handle resource cleanup for the thread.
+        HANDLE hThreadCreateFile = CreateThread(NULL, 0, DummyThreadProc, NULL, CREATE_SUSPENDED, NULL);
+        if (!hThreadCreateFile) {
+            std::cerr << "main: ERROR - CreateThread for CreateFileA failed: " << GetLastError() << std::endl;
         }
         else {
-            std::cerr << "ExecuteApiViaSetThreadContext for CreateFileA failed." << std::endl;
-            ResumeThread(hThreadCreateFile); TerminateThread(hThreadCreateFile, 1);
+            std::cout << "Created suspended thread for CreateFileA." << std::endl;
+
+            HijackContext ctxCreateFile;
+            ctxCreateFile.targetApiAddress = pCreateFileA;
+
+            const char* testFileName = "C:\\temp\\hijack_test_file.txt"; // Ensure C:\temp is writable
+            ctxCreateFile.arg1_rcx = (DWORD64)testFileName;                 // lpFileName
+            ctxCreateFile.arg2_rdx = GENERIC_WRITE | GENERIC_READ;          // dwDesiredAccess
+            ctxCreateFile.arg3_r8 = FILE_SHARE_READ;                       // dwShareMode
+            ctxCreateFile.arg4_r9 = (DWORD64)NULL;                         // lpSecurityAttributes
+
+            std::vector<DWORD64> stackArgsCreateFile;
+            stackArgsCreateFile.push_back((DWORD64)CREATE_ALWAYS);          // 5th: dwCreationDisposition
+            stackArgsCreateFile.push_back((DWORD64)FILE_ATTRIBUTE_NORMAL);  // 6th: dwFlagsAndAttributes
+            stackArgsCreateFile.push_back((DWORD64)NULL);                   // 7th: hTemplateFile
+
+            void* stackAllocCreateFile = nullptr;
+            ctxCreateFile.pPreparedStackTop = PrepareStackForApiCall(stackArgsCreateFile, pExitThread, &stackAllocCreateFile);
+
+            if (!ctxCreateFile.pPreparedStackTop) {
+                std::cerr << "main: ERROR - Failed to prepare stack for CreateFileA." << std::endl;
+                ResumeThread(hThreadCreateFile); TerminateThread(hThreadCreateFile, 1);
+            }
+            else {
+                if (ExecuteApiViaSetThreadContext(hThreadCreateFile, ctxCreateFile)) {
+                    std::cout << "SetThreadContext for CreateFileA successful. Resuming..." << std::endl;
+                    ResumeThread(hThreadCreateFile);
+                    WaitForSingleObject(hThreadCreateFile, INFINITE); // Wait for ExitThread
+                    std::cout << "CreateFileA thread exited." << std::endl;
+                    std::cout << "VERIFY: Check if '" << testFileName << "' was created." << std::endl;
+                }
+                else {
+                    std::cerr << "main: ERROR - ExecuteApiViaSetThreadContext for CreateFileA failed." << std::endl;
+                    ResumeThread(hThreadCreateFile); TerminateThread(hThreadCreateFile, 1);
+                }
+            }
+            CloseHandle(hThreadCreateFile);
+            if (stackAllocCreateFile) {
+                VirtualFree(stackAllocCreateFile, 0, MEM_RELEASE);
+                DEBUG_COUT("Freed stack for CreateFileA." << std::endl);
+            }
         }
     }
-    CloseHandle(hThreadCreateFile);
-    if (stackAllocCreateFile) VirtualFree(stackAllocCreateFile, 0, MEM_RELEASE);
     std::cout << "--- CreateFileA Test Complete ---" << std::endl;
 
-
+    std::cout << "\nAll tests finished. Press any key to close..." << std::endl;
+    std::cin.get(); // Keep console open
     return 0;
 }
