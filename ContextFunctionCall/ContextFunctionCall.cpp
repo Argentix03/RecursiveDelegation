@@ -384,10 +384,9 @@ int main() {
         "VERIFY: Check if '" + std::string(testFileName) + "' was created."
     );
 
-    // Add more tests here if needed...
-    // Example: Test with another API, perhaps one that takes no arguments to test the simplest case.
-    // FARPROC pGetTickCount = GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetTickCount");
-    // RunApiTest("GetTickCount", pGetTickCount, 0,0,0,0, {}, pExitThread, "GetTickCount called (no output to verify).");
+    // Test 3: GetTickCount (Takes no arguments).
+    FARPROC pGetTickCount = GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetTickCount");
+    RunApiTest("GetTickCount", pGetTickCount, 0,0,0,0, {}, pExitThread, "GetTickCount called (no output to verify).");
 
 
     std::cout << "\nAll tests finished. Press any key to close..." << std::endl;
