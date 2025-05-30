@@ -1,195 +1,91 @@
-// RecursiveDelegation.cpp - Implementation of a recursive process tree function delegation system
+// Keep these includes and DEBUG macros
+#include <windows.h>
 #include <iostream>
-#include <Windows.h>
-#include <string>
 #include <vector>
-#include <random>
-#include <sstream>
-#include <memory>
-#include <TlHelp32.h>
+#include <string>
+#include <cstdio>
+#include <random>   // For GenerateRandomBinaryName
+#include <sstream>  // For GenerateRandomBinaryName
+#include <memory>   // For std::unique_ptr in old ProcessChildMode (can be removed if not used)
 
-#include <ntstatus.h>
+// Define a preprocessor macro for debug prints
+#ifdef _DEBUG
+#define DEBUG_PRINTF(...) printf(__VA_ARGS__)
+#define DEBUG_COUT(x) std::cout << x
+#else
+#define DEBUG_PRINTF(...) do {} while (0)
+#define DEBUG_COUT(x) do {} while (0)
+#endif
 
-// Add this definition if <ntstatus.h> is not available
+// NTSTATUS and NtContinue_t from previous NtContinue version
+#ifndef NTSTATUS
+typedef LONG NTSTATUS;
+#endif
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
 #endif
+typedef NTSTATUS(NTAPI* NtContinue_t)(PCONTEXT ContextRecord, BOOLEAN TestAlert);
 
-// Structure to hold context data (CPU registers and state)
-struct CtxData {
-    CONTEXT Context;
-    // Additional fields can be added as needed
-};
-
-// Structure to hold stack data
-struct StackData {
-    void* Buffer;
-    SIZE_T Size;
-};
-
-// List of funny Microsoft binary names for random selection
+// Your GenerateRandomBinaryName, ResolveFunction, CreateIPCPipe, CreateCloneExecutable
+// (These seem okay for now, assuming they work as intended)
+// ... (paste your existing implementations of these helper functions here) ...
 const std::vector<std::string> MS_BINARY_NAMES = {
     "svchost", "wininit", "csrss", "lsass", "winlogon", "spoolsv", "dwm",
     "explorer", "taskmgr", "msiexec", "conhost", "rundll32", "services",
     "smss", "ntoskrnl", "regsvr32", "mmc", "dllhost", "wuauclt", "iexplore"
 };
-
-// Generate a random Microsoft-like binary name
 std::string GenerateRandomBinaryName() {
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_int_distribution<> distrib(0, MS_BINARY_NAMES.size() - 1);
-
     std::stringstream ss;
     ss << MS_BINARY_NAMES[distrib(gen)] << "_" << distrib(gen) << ".exe";
     return ss.str();
 }
-
-// Function to resolve a function pointer from a name (e.g., "Kernel32!VirtualAllocEx")
-FARPROC ResolveFunction(const std::string& funcName) {
-    size_t pos = funcName.find('!');
+FARPROC ResolveFunction(const std::string& funcNameWithModule) {
+    size_t pos = funcNameWithModule.find('!');
     if (pos == std::string::npos) {
-        std::cerr << "Invalid function name format. Expected: 'Module!Function'" << std::endl;
+        std::cerr << "ResolveFunction: Invalid format. Expected 'Module!Function', got '" << funcNameWithModule << "'" << std::endl;
         return nullptr;
     }
-
-    std::string moduleName = funcName.substr(0, pos);
-    std::string functionName = funcName.substr(pos + 1);
-
+    std::string moduleName = funcNameWithModule.substr(0, pos);
+    std::string functionName = funcNameWithModule.substr(pos + 1);
     HMODULE hModule = GetModuleHandleA(moduleName.c_str());
     if (!hModule) {
         hModule = LoadLibraryA(moduleName.c_str());
         if (!hModule) {
-            std::cerr << "Failed to load module: " << moduleName << std::endl;
+            std::cerr << "ResolveFunction: Failed to load module: " << moduleName << " Error: " << GetLastError() << std::endl;
             return nullptr;
         }
     }
-
     FARPROC procAddr = GetProcAddress(hModule, functionName.c_str());
     if (!procAddr) {
-        std::cerr << "Failed to resolve function: " << functionName << std::endl;
+        std::cerr << "ResolveFunction: Failed to resolve function: " << functionName << " in " << moduleName << " Error: " << GetLastError() << std::endl;
     }
-
     return procAddr;
 }
-
-// Create a named pipe for IPC
 HANDLE CreateIPCPipe(const std::string& pipeName, bool isServer) {
     std::string fullPipeName = "\\\\.\\pipe\\" + pipeName;
-
     if (isServer) {
-        return CreateNamedPipeA(
-            fullPipeName.c_str(),
-            PIPE_ACCESS_DUPLEX,
+        return CreateNamedPipeA(fullPipeName.c_str(), PIPE_ACCESS_DUPLEX,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-            PIPE_UNLIMITED_INSTANCES,
-            4096,
-            4096,
-            0,
-            NULL
-        );
+            PIPE_UNLIMITED_INSTANCES, 4096, 4096, 0, NULL);
     }
     else {
-        return CreateFileA(
-            fullPipeName.c_str(),
-            GENERIC_READ | GENERIC_WRITE,
-            0,
-            NULL,
-            OPEN_EXISTING,
-            0,
-            NULL
-        );
-    }
-}
-
-// Execute the target function at recursion level 0
-bool ExecuteFunction(const std::string& funcName, CtxData* ctxData, StackData* stackData) {
-    FARPROC funcPtr = ResolveFunction(funcName);
-    if (!funcPtr) {
-        return false;
-    }
-
-    // Setup execution context
-    ctxData->Context.Rip = reinterpret_cast<DWORD64>(funcPtr);
-
-    ctxData->Context.ContextFlags = CONTEXT_FULL;
-
-    // Create a trampoline that will safely exit after function execution
-    void* trampolineCode = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!trampolineCode) {
-        std::cerr << "Failed to allocate trampoline memory" << std::endl;
-        return false;
-    }
-
-    // Fill with INT 3 for debugging purposes
-    memset(trampolineCode, 0xCC, 16);
-
-    // Write a RET instruction (0xC3) at the beginning
-    *reinterpret_cast<BYTE*>(trampolineCode) = 0xC3;
-
-    // Add some debug output to verify register values before execution
-    std::cout << "Executing with registers:" << std::endl;
-    std::cout << "RCX: 0x" << std::hex << ctxData->Context.Rcx << std::endl;
-    std::cout << "RDX: 0x" << std::hex << ctxData->Context.Rdx << std::endl;
-    std::cout << "R8: 0x" << std::hex << ctxData->Context.R8 << std::endl;
-    std::cout << "R9: 0x" << std::hex << ctxData->Context.R9 << std::endl;
-    std::cout << "RSP: 0x" << std::hex << ctxData->Context.Rsp << std::endl;
-    std::cout << "RIP: 0x" << std::hex << ctxData->Context.Rip << std::endl;
-    // Extract parameters from context
-    HANDLE hProcess = reinterpret_cast<HANDLE>(ctxData->Context.Rcx);
-    LPVOID lpAddress = reinterpret_cast<LPVOID>(ctxData->Context.Rdx);
-    SIZE_T dwSize = static_cast<SIZE_T>(ctxData->Context.R8);
-    DWORD flAllocationType = static_cast<DWORD>(ctxData->Context.R9);
-
-    // Get the 5th parameter from stack
-    DWORD64* stackPtr = reinterpret_cast<DWORD64*>(ctxData->Context.Rsp);
-    DWORD flProtect = static_cast<DWORD>(stackPtr[4]);
-        // Debug output
-    std::cout << "Calling VirtualAllocEx with parameters:" << std::endl;
-    std::cout << "  hProcess: 0x" << std::hex << reinterpret_cast<DWORD64>(hProcess) << std::endl;
-    std::cout << "  lpAddress: 0x" << std::hex << reinterpret_cast<DWORD64>(lpAddress) << std::endl;
-    std::cout << "  dwSize: 0x" << std::hex << dwSize << std::endl;
-    std::cout << "  flAllocationType: 0x" << std::hex << flAllocationType << std::endl;
-    std::cout << "  flProtect: 0x" << std::hex << flProtect << std::endl;
-
-    // Execute the function using NtContinue
-    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
-    if (!ntdll) {
-        ntdll = LoadLibraryA("ntdll.dll");
-        if (!ntdll) {
-            std::cerr << "Failed to load ntdll.dll" << std::endl;
-            return false;
+        HANDLE hPipe = INVALID_HANDLE_VALUE;
+        for (int i = 0; i < 10; ++i) { // Retry connecting for a short period
+            hPipe = CreateFileA(fullPipeName.c_str(), GENERIC_READ | GENERIC_WRITE, 0, NULL,
+                OPEN_EXISTING, 0, NULL);
+            if (hPipe != INVALID_HANDLE_VALUE) break;
+            if (GetLastError() != ERROR_PIPE_BUSY) break;
+            Sleep(100); // Wait and retry if busy
         }
+        return hPipe;
     }
-
-    // Important: Set RBP properly (frame pointer)
-    ctxData->Context.Rbp = ctxData->Context.Rsp + 48; // Usually above the stack frame
-
-    // Initialize EFLAGS (typical value for normal execution)
-    ctxData->Context.EFlags = 0x202; // Standard flags: IF=1,
-    stackPtr[-1] = reinterpret_cast<DWORD64>(trampolineCode); // Return address one slot below RSP
-
-    typedef NTSTATUS(NTAPI* pNtContinue)(PCONTEXT ContextRecord, BOOLEAN TestAlert);
-    pNtContinue NtContinue = reinterpret_cast<pNtContinue>(GetProcAddress(ntdll, "NtContinue"));
-
-    if (!NtContinue) {
-        std::cerr << "Failed to resolve NtContinue" << std::endl;
-        return false;
-    }
-    else {
-		std::cout << "Resolved NtContinue successfully" << std::endl;
-    }
-
-    NTSTATUS status = NtContinue(&ctxData->Context, FALSE);
-    return NT_SUCCESS(status);
-
 }
-
-// Copy the current executable to a new random binary name
 std::string CreateCloneExecutable() {
     char currentPath[MAX_PATH];
     GetModuleFileNameA(NULL, currentPath, MAX_PATH);
-
     std::string newName = GenerateRandomBinaryName();
     std::string newPath = std::string(currentPath);
     size_t lastSlash = newPath.find_last_of('\\');
@@ -197,203 +93,608 @@ std::string CreateCloneExecutable() {
         newPath = newPath.substr(0, lastSlash + 1) + newName;
     }
     else {
-        newPath = newName;
+        newPath = newName; // Should not happen if GetModuleFileNameA gives full path
     }
-
-    CopyFileA(currentPath, newPath.c_str(), FALSE);
+    if (!CopyFileA(currentPath, newPath.c_str(), FALSE)) {
+        std::cerr << "CreateCloneExecutable: Failed to copy file to " << newPath << " Error: " << GetLastError() << std::endl;
+        return ""; // Return empty on failure
+    }
     return newPath;
 }
 
-// Main recursive delegation function
-bool RecursiveDelegate(int level, const std::string& funcName, CtxData* ctxData, StackData* stackData) {
-    std::cout << "Process " << GetCurrentProcessId() << " at recursion level: " << level << std::endl;
+extern "C" void CaptureRAX_And_CallHelper();  // Assembly stub
 
-    // If recursion level is 0 or less, execute the function
-    if (level <= 0) {
-        std::cout << "Executing function: " << funcName << std::endl;
-        return ExecuteFunction(funcName, ctxData, stackData);
+__declspec(noinline) // Good practice for function pointers
+void terminator() {
+    DEBUG_COUT("terminator: Process is exiting. Attempting to call TerminateProcess." << std::endl);
+    // GetCurrentProcess() returns a pseudo-handle (-1) which is fine for TerminateProcess on self.
+    // Exit code 0 indicates success.
+    BOOL result = TerminateProcess(GetCurrentProcess(), 0);
+    if (!result) {
+        // This is unlikely to be reached or be useful if TerminateProcess itself fails critically,
+        // but good for completeness.
+        DEBUG_PRINTF("terminator: TerminateProcess failed! Error: %lu\n", GetLastError());
+    }
+    // TerminateProcess should not return if it succeeds in initiating termination.
+    // If it does, something is very wrong.
+    DEBUG_COUT("terminator: TerminateProcess returned, which is unexpected." << std::endl);
+    // Fallback to a hard exit if TerminateProcess somehow "returns"
+    ExitProcess(1); // Exit with an error code
+}
+
+// Data to be sent back over the pipe from the C++ helper
+struct ApiCallResultResponse {
+    BOOL    wasApiCallConsideredSuccess;
+    DWORD64 apiReturnValue;
+    DWORD   lastErrorValue;
+};
+
+HANDLE g_hPipeForChildResponse = INVALID_HANDLE_VALUE;
+// C++ helper function, to be called from assembly.
+extern "C" __declspec(noinline) void NTAPI ProcessResultAndExit(DWORD64 raxFromApi) {
+    DEBUG_PRINTF("ProcessResultAndExit: Captured RAX from target API = 0x%llX\n", raxFromApi);
+
+    // Here you could add logic to check raxFromApi and call GetLastError()
+    // For example:
+    DWORD lastError = 0;
+    bool apiCallSuccess = true; // Assume success initially
+
+    // Example check for typical failure returns (adjust based on actual API)
+    if (raxFromApi == 0 || raxFromApi == (DWORD64)INVALID_HANDLE_VALUE) {
+        apiCallSuccess = false;
+        lastError = GetLastError(); // Get error code if API indicated failure
+        DEBUG_PRINTF("ProcessResultAndExit: Target API call appears to have failed. LastError: %lu\n", lastError);
+    }
+    else {
+        DEBUG_COUT("ProcessResultAndExit: Target API call appears to have succeeded." << std::endl);
     }
 
-    // Create a clone executable with a random name
-    std::string clonePath = CreateCloneExecutable();
+    // TODO: Send 'apiCallSuccess', 'raxFromApi', 'lastError' back to parent via pipe.
+    // This part requires passing the pipe handle and WriteFile FARPROC to this C++ helper,
+    // which means the assembly stub needs to pass more arguments (e.g., via StubWorkerContext).
+    // For now, we just print and exit.
+    
+	std::string pipeName = "RecursiveDelegationPipe_" + std::to_string(GetCurrentProcessId()) + "_0"; // Level 0 pipe name
+	
+    if (g_hPipeForChildResponse == INVALID_HANDLE_VALUE) {
+        lastError = GetLastError(); // Get error code if API indicated failure
+        DEBUG_PRINTF("ProcessResultAndExit: Failed to connect to pipe. LastError: %lu\n", lastError, lastError);
+    }
 
-    // Create a unique pipe name for IPC
-    std::stringstream pipeName;
-    pipeName << "RecursiveDelegation_" << GetCurrentProcessId() << "_" << level;
+    DEBUG_COUT("Child: Connected to pipe." << std::endl);
+	BOOL result = TRUE; // reaching here means api was called. up to the original caller to look at rax return value and decide what the results mean
+    DWORD bytesWritten;
+    if (!WriteFile(g_hPipeForChildResponse, &result, sizeof(BOOL), &bytesWritten, NULL) || bytesWritten != sizeof(BOOL)) {
+        std::cerr << "Child: Failed to write result to pipe. Error: " << GetLastError() << std::endl;
+        // Continue to close pipe
+    }
+    DEBUG_COUT("Child: Sent result to parent." << std::endl);
+	Sleep(10000); // Give time for parent to read before closing
+    DEBUG_COUT("CppHelper_ProcessResultAndExit: Terminating process." << std::endl);
+    TerminateProcess(GetCurrentProcess(), apiCallSuccess ? 0 : 1); // Exit code based on API success
+    ExitProcess(apiCallSuccess ? 0 : 2); // Fallback if TerminateProcess somehow returns/fails
+}
 
-    // Create a pipe server
-    HANDLE hPipe = CreateIPCPipe(pipeName.str(), true);
-    if (hPipe == INVALID_HANDLE_VALUE) {
-        std::cerr << "Failed to create pipe server" << std::endl;
+// Our robust PrepareStackForApiCall (from previous correct version)
+// ... (paste the full PrepareStackForApiCall function here) ...
+void* PrepareStackForApiCall(
+    const std::vector<DWORD64>& stackArgs_in_order,
+    FARPROC pRetAddressForApi,
+    void** outStackAllocationBase
+) {
+    if (!pRetAddressForApi || !outStackAllocationBase) {
+        std::cerr << "PrepareStackForApiCall: ERROR - Null pRetAddressForApi or outStackAllocationBase." << std::endl;
+        return nullptr;
+    }
+    const size_t shadowSpaceSize = 32;
+    const size_t retAddrSlotSize = 8;
+    const size_t firstStackArgOffset = 0x28;
+    size_t numStackArgs = stackArgs_in_order.size();
+    size_t totalStackArgsSizeBytes = numStackArgs * sizeof(DWORD64);
+    SIZE_T allocationSize = (2 << 20);  // not just for our functions but enough for everything else that runs in the thread such as the thread cleanup routine
+    SIZE_T minRequiredForOurData = retAddrSlotSize + shadowSpaceSize + totalStackArgsSizeBytes + 16;
+    if (allocationSize < minRequiredForOurData) {
+        allocationSize = minRequiredForOurData + 4096;
+        DEBUG_COUT("  INFO: Increased allocationSize to " << allocationSize << " due to argument data size." << std::endl);
+    }
+    void* stackBase = VirtualAlloc(NULL, allocationSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!stackBase) {
+        std::cerr << "PrepareStackForApiCall: ERROR - VirtualAlloc failed. Error: " << GetLastError() << std::endl;
+        return nullptr;
+    }
+    *outStackAllocationBase = stackBase;
+    DEBUG_COUT("  DEBUG: PrepareStackForApiCall - stackBase = " << stackBase
+        << ", allocationSize = " << allocationSize << std::endl);
+    char* pStackHighWatermark = (char*)stackBase + allocationSize;
+    char* pTentative_Addr_5th_Arg_Slot = pStackHighWatermark - totalStackArgsSizeBytes;
+    char* pProspectiveRsp = pTentative_Addr_5th_Arg_Slot - shadowSpaceSize - retAddrSlotSize;
+    DEBUG_COUT("  DEBUG: pStackHighWatermark (initial top for calc) = " << (void*)pStackHighWatermark << std::endl);
+    DEBUG_COUT("  DEBUG: pTentative_Addr_5th_Arg_Slot (if args pushed from top) = " << (void*)pTentative_Addr_5th_Arg_Slot << std::endl);
+    DEBUG_COUT("  DEBUG: pProspectiveRsp (unaligned RSP target) = " << (void*)pProspectiveRsp << std::endl);
+    DWORD64 finalRspVal = ((DWORD64)pProspectiveRsp - 8ULL) & ~15ULL;
+    finalRspVal += 8ULL;
+    DEBUG_COUT("  DEBUG: finalRspVal (calculated and aligned RSP) = " << (void*)finalRspVal << std::endl);
+    if (finalRspVal < (DWORD64)stackBase || (finalRspVal + retAddrSlotSize) >((DWORD64)stackBase + allocationSize)) {
+        std::cerr << "PrepareStackForApiCall: ERROR - finalRspVal is outside allocated stack region after alignment." << std::endl;
+        std::cerr << "  stackBase: " << stackBase << ", stackEnd: " << (void*)((char*)stackBase + allocationSize - 1) << std::endl;
+        std::cerr << "  finalRspVal: " << (void*)finalRspVal << std::endl;
+        VirtualFree(stackBase, 0, MEM_RELEASE); *outStackAllocationBase = nullptr; return nullptr;
+    }
+    *(DWORD64*)finalRspVal = (DWORD64)pRetAddressForApi;
+    DEBUG_PRINTF("  DEBUG: PLACED Return Address (value 0x%llX) to actual RSP %p\n",
+        (unsigned long long)(DWORD64)pRetAddressForApi, (void*)finalRspVal);
+    char* pArgWriter = (char*)finalRspVal + firstStackArgOffset;
+    DEBUG_COUT("  DEBUG: Placing stack arguments relative to finalRspVal:" << std::endl);
+    for (size_t i = 0; i < numStackArgs; ++i) {
+        if ((pArgWriter + sizeof(DWORD64)) > ((char*)stackBase + allocationSize)) {
+            std::cerr << "PrepareStackForApiCall: ERROR - About to write stack argument #" << (i + 5)
+                << " out of allocated stack bounds." << std::endl;
+            std::cerr << "  pArgWriter: " << (void*)pArgWriter << ", stackEnd: "
+                << (void*)((char*)stackBase + allocationSize - 1) << std::endl;
+            VirtualFree(stackBase, 0, MEM_RELEASE); *outStackAllocationBase = nullptr; return nullptr;
+        }
+        *(DWORD64*)pArgWriter = stackArgs_in_order[i];
+        DEBUG_PRINTF("  DEBUG: PLACED arg #%zu (value 0x%llX) to address %p (RSP+0x%X)\n",
+            i + 5, (unsigned long long)stackArgs_in_order[i], (void*)pArgWriter,
+            (unsigned int)(firstStackArgOffset + i * sizeof(DWORD64)));
+        pArgWriter += sizeof(DWORD64);
+    }
+    std::cout << "Prepared stack. Final New RSP will be: " << (void*)finalRspVal
+        << " (RSP % 16 = " << (finalRspVal % 16) << ")" << std::endl;
+    std::cout << "  Return address for API set to: " << (void*)pRetAddressForApi << std::endl;
+    if (!stackArgs_in_order.empty()) {
+        DEBUG_PRINTF("  VERIFICATION: 5th arg (value 0x%llX) is at %p (RSP+0x%X)\n",
+            (unsigned long long)stackArgs_in_order[0], (void*)(finalRspVal + firstStackArgOffset),
+            (unsigned int)firstStackArgOffset);
+        if (numStackArgs > 1) {
+            DEBUG_PRINTF("  VERIFICATION: 6th arg (value 0x%llX) is at %p (RSP+0x%X)\n",
+                (unsigned long long)stackArgs_in_order[1], (void*)(finalRspVal + firstStackArgOffset + sizeof(DWORD64)),
+                (unsigned int)(firstStackArgOffset + sizeof(DWORD64)));
+        }
+    }
+    else {
+        std::cout << "  No stack arguments were provided for the API call." << std::endl;
+    }
+    return (void*)finalRspVal;
+}
+
+
+// New structure for passing API call parameters
+struct ApiCallParams {
+    char funcNameWithModule[256]; // e.g., "Kernel32!VirtualAllocEx"
+    DWORD64 rcx_val;
+    DWORD64 rdx_val;
+    DWORD64 r8_val;
+    DWORD64 r9_val;
+    // Stack arguments will be sent as a vector separately
+};
+
+// Renamed and refactored version of your old ExecuteFunction
+// This is called at level 0 to actually perform the API call.
+bool ExecuteApiCallAtLevelZero(
+    const ApiCallParams* pCallParams,
+    const std::vector<DWORD64>* pStackArgs,
+    NtContinue_t pNtContinueFunc, // Resolved NtContinue
+    FARPROC pExitThreadFunc       // Resolved ExitThread
+) {
+    DEBUG_COUT("ExecuteApiCallAtLevelZero: Preparing to execute API: " << pCallParams->funcNameWithModule << std::endl);
+
+    FARPROC targetApi = ResolveFunction(pCallParams->funcNameWithModule);
+    if (!targetApi) {
+        std::cerr << "ExecuteApiCallAtLevelZero: Failed to resolve target API." << std::endl;
         return false;
     }
 
-    // Prepare command line for child process
-    std::stringstream cmdLine;
-    cmdLine << "\"" << clonePath << "\" " << (level - 1) << " \"" << funcName << "\" " << pipeName.str();
+    void* stackAllocationBase = nullptr;
+    void* pNewStackTopForTargetApi = PrepareStackForApiCall(
+        *pStackArgs,
+        (FARPROC)CaptureRAX_And_CallHelper, // Target API will "return" to our terminator function
+        &stackAllocationBase
+    );
 
-    // Create child process
+    if (!pNewStackTopForTargetApi) {
+        std::cerr << "ExecuteApiCallAtLevelZero: ERROR - Failed to prepare stack for target API." << std::endl;
+        if (stackAllocationBase) VirtualFree(stackAllocationBase, 0, MEM_RELEASE);
+        return false;
+    }
+
+    CONTEXT targetContext;
+    ZeroMemory(&targetContext, sizeof(CONTEXT));
+    // For NtContinue, explicitly set segments if not relying on current thread's.
+    // A common practice is to get current context, modify, then pass to NtContinue.
+    // However, for a fresh "warp", minimal context might work, but can be risky.
+    // To be safer, let's capture the current thread's full context and modify that.
+    // This is especially important for segment registers (CS, DS, ES, SS, FS, GS).
+    // Since this function *is* the thread that will be warped, this is appropriate.
+
+    // Get current context as a base
+    RtlCaptureContext(&targetContext); // Or GetThreadContext(GetCurrentThread(), &targetContext)
+    // RtlCaptureContext is often preferred for current thread.
+
+    // Now, overwrite the parts we need for the target API call
+    // The ContextFlags field for NtContinue should reflect what we are providing
+    // and what the system might need to correctly switch.
+    //targetContext.ContextFlags = CONTEXT_CONTROL |
+    //    CONTEXT_INTEGER |
+    //    CONTEXT_SEGMENTS |
+    //    CONTEXT_FLOATING_POINT; // Add FPU/XMM state
+
+    //// Check if XState is enabled and used, then include it.
+    //// This requires careful handling of the XState save area.
+    //// RtlCaptureContext *should* have populated it correctly.
+    //ULONG64 xstateFeatures = GetEnabledXStateFeatures();
+    //if (xstateFeatures != 0) { // If any XState features are enabled. AVX and SSE stuff is nasty and confusing.
+    //    targetContext.ContextFlags |= CONTEXT_XSTATE;
+    //    // Ensure the XSTATE_SAVE_AREA is properly aligned and large enough.
+    //    // RtlCaptureContext populates the XState features in the CONTEXT structure.
+    //    // The CONTEXT structure itself contains space for this.
+    //}
+
+    targetContext.Rip = (DWORD64)targetApi;
+    targetContext.Rcx = pCallParams->rcx_val;
+    targetContext.Rdx = pCallParams->rdx_val;
+    targetContext.R8 = pCallParams->r8_val;
+    targetContext.R9 = pCallParams->r9_val;
+    targetContext.Rsp = (DWORD64)pNewStackTopForTargetApi;
+    targetContext.Rbp = targetContext.Rsp; // Set RBP to new RSP
+
+    // EFlags: The original code set it to 0x202.
+    // RtlCaptureContext will have the current EFlags. Modifying IF (Interrupt Flag)
+    // is generally not needed unless specifically intended. For now, let's trust
+    // what RtlCaptureContext provides, or set a known-good default if issues arise.
+    // targetContext.EFlags = 0x202; // Overwrite if necessary, but usually not.
+    DEBUG_PRINTF("ExecuteApiCallAtLevelZero: Prepared CONTEXT for NtContinue:\n");
+    DEBUG_PRINTF("  RIP: 0x%llX\n", targetContext.Rip);
+    DEBUG_PRINTF("  RCX: 0x%llX, RDX: 0x%llX, R8: 0x%llX, R9: 0x%llX\n",
+        targetContext.Rcx, targetContext.Rdx, targetContext.R8, targetContext.R9);
+    DEBUG_PRINTF("  RSP: 0x%llX, RBP: 0x%llX\n", targetContext.Rsp, targetContext.Rbp);
+    DEBUG_PRINTF("  EFlags: 0x%X\n", targetContext.EFlags); // Can be noisy, current EFlags is fine.
+
+    DEBUG_COUT("ExecuteApiCallAtLevelZero: Calling NtContinue..." << std::endl);
+    NTSTATUS status = pNtContinueFunc(&targetContext, FALSE);
+
+    std::cerr << "ExecuteApiCallAtLevelZero: ERROR - NtContinue returned with status 0x"
+        << std::hex << status << std::dec << ". This is unexpected." << std::endl;
+    if (stackAllocationBase) {
+        VirtualFree(stackAllocationBase, 0, MEM_RELEASE);
+    }
+    // This return is only hit if NtContinue fails, which means the thread did not warp.
+    return NT_SUCCESS(status);
+}
+
+// Modified RecursiveDelegate
+bool RecursiveDelegate(
+    int level,
+    const ApiCallParams* pCallParams,
+    const std::vector<DWORD64>* pStackArgs,
+    NtContinue_t pNtContinueFunc, // Pass these down
+    FARPROC pExitThreadFunc
+) {
+    std::cout << "Process " << GetCurrentProcessId() << " at recursion level: " << level
+        << ", target: " << pCallParams->funcNameWithModule << std::endl;
+
+    if (level <= 0) {
+        std::cout << "Executing function at level 0: " << pCallParams->funcNameWithModule << std::endl;
+        return ExecuteApiCallAtLevelZero(pCallParams, pStackArgs, pNtContinueFunc, pExitThreadFunc);
+    }
+
+    std::string clonePath = CreateCloneExecutable();
+    if (clonePath.empty()) {
+        std::cerr << "RecursiveDelegate: Failed to create clone executable." << std::endl;
+        return false;
+    }
+
+    std::stringstream pipeNameSs;
+    pipeNameSs << "RecursiveDelegationPipe_" << GetCurrentProcessId() << "_" << level;
+    std::string pipeName = pipeNameSs.str();
+
+    HANDLE hPipe = CreateIPCPipe(pipeName, true);
+    if (hPipe == INVALID_HANDLE_VALUE) {
+        std::cerr << "RecursiveDelegate: Failed to create pipe server '" << pipeName << "'. Error: " << GetLastError() << std::endl;
+        DeleteFileA(clonePath.c_str()); // Clean up clone
+        return false;
+    }
+    DEBUG_COUT("RecursiveDelegate: Pipe server created: " << pipeName << std::endl);
+
+    std::stringstream cmdLine;
+    // Quote clonePath in case it has spaces
+    cmdLine << "\"" << clonePath << "\" " << (level - 1)
+        << " \"" << pCallParams->funcNameWithModule << "\" " // Pass original func name string
+        << pipeName; // Pipe name for child to connect to
+
     STARTUPINFOA si = { sizeof(STARTUPINFOA) };
     PROCESS_INFORMATION pi;
 
-    if (!CreateProcessA(
-        NULL,
-        const_cast<LPSTR>(cmdLine.str().c_str()),
-        NULL,
-        NULL,
-        FALSE,
-        0,
-        NULL,
-        NULL,
-        &si,
-        &pi
-    )) {
-        std::cerr << "Failed to create child process. Error: " << GetLastError() << std::endl;
+    DEBUG_COUT("RecursiveDelegate: Creating child process: " << cmdLine.str() << std::endl);
+    if (!CreateProcessA(NULL, const_cast<LPSTR>(cmdLine.str().c_str()), NULL, NULL,
+        TRUE, 0, NULL, NULL, &si, &pi)) {
+        std::cerr << "RecursiveDelegate: Failed to create child process. Error: " << GetLastError() << std::endl;
         CloseHandle(hPipe);
+        DeleteFileA(clonePath.c_str());
         return false;
     }
+    DEBUG_COUT("RecursiveDelegate: Child process created. PID: " << pi.dwProcessId << std::endl);
 
-    // Connect to the client
+    DEBUG_COUT("RecursiveDelegate: Waiting for pipe client to connect..." << std::endl);
     if (!ConnectNamedPipe(hPipe, NULL) && GetLastError() != ERROR_PIPE_CONNECTED) {
-        std::cerr << "Failed to connect to client" << std::endl;
+        std::cerr << "RecursiveDelegate: Failed to connect to client on pipe. Error: " << GetLastError() << std::endl;
+        TerminateProcess(pi.hProcess, 1); // Terminate child if pipe connection fails
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
         CloseHandle(hPipe);
+        DeleteFileA(clonePath.c_str());
         return false;
     }
+    DEBUG_COUT("RecursiveDelegate: Pipe client connected." << std::endl);
 
-    // Send the context and stack data
     DWORD bytesWritten;
-    WriteFile(hPipe, ctxData, sizeof(CtxData), &bytesWritten, NULL);
-    WriteFile(hPipe, &stackData->Size, sizeof(SIZE_T), &bytesWritten, NULL);
-    WriteFile(hPipe, stackData->Buffer, stackData->Size, &bytesWritten, NULL);
+    // Send ApiCallParams (fixed size structure)
+    if (!WriteFile(hPipe, pCallParams, sizeof(ApiCallParams), &bytesWritten, NULL) || bytesWritten != sizeof(ApiCallParams)) {
+        std::cerr << "RecursiveDelegate: Failed to write ApiCallParams to pipe. Error: " << GetLastError() << std::endl;
+        // ... (cleanup) ...
+        return false;
+    }
+    DEBUG_COUT("RecursiveDelegate: Sent ApiCallParams." << std::endl);
 
-    // Wait for the result
-    BOOL result;
+
+    // Send number of stack arguments
+    SIZE_T numStackArgs = pStackArgs->size();
+    if (!WriteFile(hPipe, &numStackArgs, sizeof(SIZE_T), &bytesWritten, NULL) || bytesWritten != sizeof(SIZE_T)) {
+        std::cerr << "RecursiveDelegate: Failed to write numStackArgs to pipe. Error: " << GetLastError() << std::endl;
+        // ... (cleanup) ...
+        return false;
+    }
+    DEBUG_COUT("RecursiveDelegate: Sent numStackArgs: " << numStackArgs << std::endl);
+
+
+    // Send stack argument data (if any)
+    if (numStackArgs > 0) {
+        SIZE_T stackArgsDataSize = numStackArgs * sizeof(DWORD64);
+        if (!WriteFile(hPipe, pStackArgs->data(), stackArgsDataSize, &bytesWritten, NULL) || bytesWritten != stackArgsDataSize) {
+            std::cerr << "RecursiveDelegate: Failed to write stackArgs data to pipe. Error: " << GetLastError() << std::endl;
+            // ... (cleanup below needs to be robust) ...
+            TerminateProcess(pi.hProcess, 1); CloseHandle(pi.hProcess); CloseHandle(pi.hThread); CloseHandle(hPipe); DeleteFileA(clonePath.c_str());
+            return false;
+        }
+        DEBUG_COUT("RecursiveDelegate: Sent stackArgs data." << std::endl);
+    }
+
+
+    DEBUG_COUT("RecursiveDelegate: Waiting for result from child..." << std::endl);
+    BOOL resultFromChild;
     DWORD bytesRead;
-    ReadFile(hPipe, &result, sizeof(BOOL), &bytesRead, NULL);
+    if (!ReadFile(hPipe, &resultFromChild, sizeof(BOOL), &bytesRead, NULL) || bytesRead != sizeof(BOOL)) {
+        std::cerr << "RecursiveDelegate: Failed to read result from child. Error: " << GetLastError() << std::endl;
+        resultFromChild = FALSE; // Assume failure
+    }
+    DEBUG_COUT("RecursiveDelegate: Received result from child: " << (resultFromChild ? "TRUE " : "FALSE ") << std::endl);
 
-    // Cleanup
+    // Wait for child process to terminate fully
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DEBUG_COUT("RecursiveDelegate: Child process terminated." << std::endl);
+
+
     CloseHandle(hPipe);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
+    if (!DeleteFileA(clonePath.c_str())) {
+        std::cerr << "RecursiveDelegate: Warning - Failed to delete clone " << clonePath << ". Error: " << GetLastError() << std::endl;
+    }
 
-    return result == TRUE;
+
+    return resultFromChild == TRUE;
 }
 
-// Process the command line arguments when running as a spawned child
-bool ProcessChildMode(int argc, char* argv[]) {
-    if (argc < 4) {
+bool ProcessChildMode(
+    int argc, char* argv[],
+    NtContinue_t pNtContinueFunc, // Pass these down
+    FARPROC pExitThreadFunc
+) {
+    if (argc < 4) { // ExecutableName, Level, FuncName, PipeName
+        std::cerr << "Child: Insufficient arguments." << std::endl;
         return false;
     }
 
     int level = atoi(argv[1]);
-    std::string funcName = argv[2];
-    std::string pipeName = argv[3];
+    // argv[2] is funcNameWithModule, argv[3] is pipeName
+    // We don't need funcNameWithModule directly here, as it's inside ApiCallParams
 
-    // Connect to the parent process pipe
+    std::string pipeName = argv[3];
+    DEBUG_COUT("Child (PID " << GetCurrentProcessId() << "): Connecting to pipe: " << pipeName << std::endl);
+
+
     HANDLE hPipe = CreateIPCPipe(pipeName, false);
     if (hPipe == INVALID_HANDLE_VALUE) {
-        std::cerr << "Child: Failed to connect to pipe" << std::endl;
+        std::cerr << "Child: Failed to connect to pipe '" << pipeName << "'. Error: " << GetLastError() << std::endl;
         return false;
     }
+    g_hPipeForChildResponse = hPipe;
+    DEBUG_COUT("Child: Connected to pipe." << std::endl);
 
-    // Receive context and stack data
-    CtxData ctxData;
-    SIZE_T stackSize;
+    ApiCallParams receivedApiParams;
+    std::vector<DWORD64> receivedStackArgs;
     DWORD bytesRead;
 
-    ReadFile(hPipe, &ctxData, sizeof(CtxData), &bytesRead, NULL);
-    ReadFile(hPipe, &stackSize, sizeof(SIZE_T), &bytesRead, NULL);
+    if (!ReadFile(hPipe, &receivedApiParams, sizeof(ApiCallParams), &bytesRead, NULL) || bytesRead != sizeof(ApiCallParams)) {
+        std::cerr << "Child: Failed to read ApiCallParams. Error: " << GetLastError() << std::endl;
+        CloseHandle(hPipe); return false;
+    }
+    DEBUG_COUT("Child: Received ApiCallParams for: " << receivedApiParams.funcNameWithModule << std::endl);
 
-    std::unique_ptr<char[]> stackBuffer(new char[stackSize]);
-    StackData stackData = { stackBuffer.get(), stackSize };
+    SIZE_T numStackArgs;
+    if (!ReadFile(hPipe, &numStackArgs, sizeof(SIZE_T), &bytesRead, NULL) || bytesRead != sizeof(SIZE_T)) {
+        std::cerr << "Child: Failed to read numStackArgs. Error: " << GetLastError() << std::endl;
+        CloseHandle(hPipe); return false;
+    }
+    DEBUG_COUT("Child: Received numStackArgs: " << numStackArgs << std::endl);
 
-    ReadFile(hPipe, stackData.Buffer, stackData.Size, &bytesRead, NULL);
+
+    if (numStackArgs > 0) {
+        receivedStackArgs.resize(numStackArgs);
+        SIZE_T stackArgsDataSize = numStackArgs * sizeof(DWORD64);
+        if (!ReadFile(hPipe, receivedStackArgs.data(), stackArgsDataSize, &bytesRead, NULL) || bytesRead != stackArgsDataSize) {
+            std::cerr << "Child: Failed to read stackArgs data. Error: " << GetLastError() << std::endl;
+            CloseHandle(hPipe); return false;
+        }
+        DEBUG_COUT("Child: Received stackArgs data." << std::endl);
+    }
 
     // Call RecursiveDelegate with the received data
-    BOOL result = RecursiveDelegate(level, funcName, &ctxData, &stackData);
+    BOOL result = RecursiveDelegate(level, &receivedApiParams, &receivedStackArgs, pNtContinueFunc, pExitThreadFunc);
+    DEBUG_COUT("Child: RecursiveDelegate result: " << (result ? "TRUE" : "FALSE") << std::endl);
 
-    // Send the result back to the parent
+
     DWORD bytesWritten;
-    WriteFile(hPipe, &result, sizeof(BOOL), &bytesWritten, NULL);
+    if (!WriteFile(hPipe, &result, sizeof(BOOL), &bytesWritten, NULL) || bytesWritten != sizeof(BOOL)) {
+        std::cerr << "Child: Failed to write result to pipe. Error: " << GetLastError() << std::endl;
+        // Continue to close pipe
+    }
+    DEBUG_COUT("Child: Sent result to parent." << std::endl);
 
-    // Cleanup
     CloseHandle(hPipe);
-
-    return true;
+    DEBUG_COUT("Child: Exiting." << std::endl);
+    return result == TRUE; // The return value of ProcessChildMode determines main's exit code for child
 }
 
 int main(int argc, char* argv[]) {
-    // Check if running as a spawned child
-    if (argc > 1) {
-        if (ProcessChildMode(argc, argv)) {
-            return 0;
+    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+    if (!hNtdll) { // Should always be loaded
+        hNtdll = LoadLibraryA("ntdll.dll"); // Attempt to load if somehow not found
+        if (!hNtdll) {
+            std::cerr << "main: CRITICAL - Failed to load ntdll.dll. Error: " << GetLastError() << std::endl;
+            return 1;
         }
     }
 
-    // Initialize context and stack data
-    CtxData ctxData = {};
-    ctxData.Context.ContextFlags = CONTEXT_FULL;
+    NtContinue_t pNtContinue = (NtContinue_t)GetProcAddress(hNtdll, "NtContinue");
+    FARPROC pExitThread = GetProcAddress(GetModuleHandleA("kernel32.dll"), "ExitThread");
 
-    // Allocate stack for the target function
-    const SIZE_T STACK_SIZE = 1024 * 1024; // 1MB stack
-    void* stackBuffer = VirtualAlloc(NULL, STACK_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!stackBuffer) {
-        std::cerr << "Failed to allocate stack" << std::endl;
+    if (!pNtContinue || !pExitThread) {
+        std::cerr << "main: CRITICAL - Failed to resolve NtContinue or ExitThread. Error: "
+            << (!pNtContinue ? "NtContinue " : "") << (!pExitThread ? "ExitThread " : "")
+            << GetLastError() << std::endl;
         return 1;
     }
+    DEBUG_PRINTF("main: NtContinue at %p, ExitThread at %p\n", (void*)pNtContinue, (void*)pExitThread);
 
-    StackData stackData = { stackBuffer, STACK_SIZE };
 
-    // Example: VirtualAllocEx(hProcess, NULL, dwSize, MEM_COMMIT, PAGE_EXECUTE_READWRITE)
-    HANDLE hProcess = GetCurrentProcess();
-    LPVOID lpAddress = NULL;
-    SIZE_T dwSize = 4096;
-    DWORD flAllocationType = MEM_COMMIT;
-    DWORD flProtect = PAGE_EXECUTE_READWRITE;
+    if (argc > 1) { // Arguments suggest it's a child process
+        DEBUG_COUT("main: Detected child mode." << std::endl);
+        // Child process returns 0 on success, 1 on internal failure path
+        return ProcessChildMode(argc, argv, pNtContinue, pExitThread) ? 0 : 1;
+    }
 
-    // According to x64 calling convention:
-    // 1. First 4 parameters go in registers
-    ctxData.Context.Rcx = reinterpret_cast<DWORD64>(hProcess);        // 1st param: hProcess
-    ctxData.Context.Rdx = reinterpret_cast<DWORD64>(lpAddress);       // 2nd param: lpAddress
-    ctxData.Context.R8 = static_cast<DWORD64>(dwSize);                // 3rd param: dwSize
-    ctxData.Context.R9 = static_cast<DWORD64>(flAllocationType);      // 4th param: flAllocationType
+    // ---- Parent Process Logic ----
+    DEBUG_COUT("main: Detected parent mode." << std::endl);
+    LoadLibraryA("user32.dll"); // For MessageBoxA example, if used directly by parent
 
-    // 2. Prepare the stack
-    // The stack must be 16-byte aligned before the call
-    char* stackTop = reinterpret_cast<char*>(stackBuffer) + STACK_SIZE;
-    stackTop = reinterpret_cast<char*>((reinterpret_cast<DWORD64>(stackTop) & ~0xF) - 8);  // 16-byte align, 8-byte buffer
+    // Example: Call Kernel32!VirtualAllocEx(GetCurrentProcess(), NULL, 20480, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
+    // RCX = hProcess, RDX = lpAddress, R8 = dwSize, R9 = flAllocationType
+    // Stack Arg 5 = flProtect
 
-    // Allocate stack space for parameters and shadow space
-    // - 32 bytes of shadow space for the first 4 parameters
-    // - 8 bytes for the 5th parameter
-    // - 8 bytes for the return address
-    DWORD64* stackPtr = reinterpret_cast<DWORD64*>(stackTop - 48);
+ // --- Test 2: VirtualAllocEx using an INHERITED OpenProcess handle ---
+    std::cout << "\n--- TESTING VirtualAllocEx (Self, Inherited OpenProcess Handle) ---" << std::endl;
+    HANDLE hSelfProcessInheritable = NULL;
+    SECURITY_ATTRIBUTES sa_inherit;
+    sa_inherit.nLength = sizeof(SECURITY_ATTRIBUTES);
+    sa_inherit.lpSecurityDescriptor = NULL;
+    sa_inherit.bInheritHandle = TRUE; // Make the handle inheritable
 
-    // Shadow space (leave as is, used by callee if needed)
-    stackPtr[0] = 0;  // Shadow space for RCX
-    stackPtr[1] = 0;  // Shadow space for RDX
-    stackPtr[2] = 0;  // Shadow space for R8
-    stackPtr[3] = 0;  // Shadow space for R9
+    // Open a handle to the current process with specific rights needed by VirtualAllocEx
+    // PROCESS_VM_OPERATION is required for VirtualAllocEx.
+    hSelfProcessInheritable = OpenProcess(
+        PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE, // Desired access
+        TRUE,                       // bInheritHandle (already set in sa, but OpenProcess also has this flag)
+        GetCurrentProcessId()       // Process ID
+    );
 
-    // 5th parameter goes on the stack
-    stackPtr[4] = static_cast<DWORD64>(flProtect);  // 5th param: flProtect
+    if (hSelfProcessInheritable == NULL) {
+        std::cerr << "main: ERROR - OpenProcess failed: " << GetLastError() << std::endl;
+    }
+    else {
+        DEBUG_PRINTF("main: Opened inheritable handle to self: 0x%llX\n", (DWORD64)hSelfProcessInheritable);
 
-    // Return address (dummy, as we're using NtContinue)
-    stackPtr[5] = 0;
+        ApiCallParams initialCallParams = {}; // Zero initialize
+        strncpy_s(initialCallParams.funcNameWithModule, "Kernel32!VirtualAllocEx", _TRUNCATE);
+        initialCallParams.rcx_val = (DWORD64)hSelfProcessInheritable;
+        initialCallParams.rdx_val = (DWORD64)NULL; // Let OS choose address
+        initialCallParams.r8_val = 20480;          // dwSize
+        initialCallParams.r9_val = MEM_COMMIT | MEM_RESERVE; // flAllocationType
 
-    // Point RSP to our stack (just above the shadow space)
-    ctxData.Context.Rsp = reinterpret_cast<DWORD64>(stackPtr);
+        std::vector<DWORD64> initialStackArgs;
+        initialStackArgs.push_back(PAGE_EXECUTE_READWRITE); // 5th param: flProtect
 
-    // Start the recursive delegation with 100 levels
-    const int MAX_RECURSION = 0;
-    bool result = RecursiveDelegate(MAX_RECURSION, "Kernel32!VirtualAllocEx", &ctxData, &stackData);
+        const int MAX_RECURSION = 1; // Set recursion depth (e.g., 2 levels deep)
+        DEBUG_COUT("main: Starting recursive delegation. Max depth: " << MAX_RECURSION << std::endl);
+        bool overallResult = RecursiveDelegate(MAX_RECURSION, &initialCallParams, &initialStackArgs, pNtContinue, pExitThread);
 
-    std::cout << "Recursive delegation " << (result ? "succeeded" : "failed") << std::endl;
+        std::cout << "Overall recursive delegation " << (overallResult ? "succeeded" : "failed") << std::endl;
+        if (overallResult && MAX_RECURSION == 0 && strcmp(initialCallParams.funcNameWithModule, "Kernel32!VirtualAllocEx") == 0) {
+            std::cout << "  (Note: VirtualAllocEx was called. Result capture isn't implemented." << std::endl;
+        }
 
-    // Cleanup
-    VirtualFree(stackBuffer, 0, MEM_RELEASE);
+        // --- Test 1: VirtualAllocEx (as before with recurse level 2) ---
+        ApiCallParams vaParams = {};
+        strncpy_s(vaParams.funcNameWithModule, "Kernel32!VirtualAllocEx", _TRUNCATE);
+        vaParams.rcx_val = (DWORD64)hSelfProcessInheritable;
+        vaParams.rdx_val = (DWORD64)NULL;
+        vaParams.r8_val = (2 << 14);
+        vaParams.r9_val = MEM_COMMIT | MEM_RESERVE;
+        std::vector<DWORD64> vaStackArgs;
+        vaStackArgs.push_back(PAGE_EXECUTE_READWRITE);
 
-    return result ? 0 : 1;
+        RecursiveDelegate(2, &vaParams, &vaStackArgs, pNtContinue, pExitThread); // Test at level 0
+
+        // --- Test 2: SetEvent with an inherited handle ---
+        std::cout << "\n--- TESTING SetEvent with Inherited Handle ---" << std::endl;
+
+        SECURITY_ATTRIBUTES sa;
+        sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+        sa.lpSecurityDescriptor = NULL;
+        sa.bInheritHandle = TRUE; // Make the event handle inheritable
+
+        HANDLE hEventForChild = CreateEventA(&sa, TRUE, FALSE, "MyRecursiveEventTest"); // Manual-reset, initially non-signaled
+        if (hEventForChild == NULL) {
+            std::cerr << "main: ERROR - CreateEventA failed: " << GetLastError() << std::endl;
+        }
+        else {
+            DEBUG_PRINTF("main: Created inheritable event handle: 0x%llX\n", (DWORD64)hEventForChild);
+
+            ApiCallParams seParams = {};
+            strncpy_s(seParams.funcNameWithModule, "Kernel32!SetEvent", _TRUNCATE);
+            // SetEvent takes one argument: HANDLE hEvent (in RCX)
+            seParams.rcx_val = (DWORD64)hEventForChild; // Pass the parent's handle value
+            seParams.rdx_val = 0;
+            seParams.r8_val = 0;
+            seParams.r9_val = 0;
+            std::vector<DWORD64> seStackArgs; // SetEvent has no stack arguments
+
+            std::cout << "main: Delegating SetEvent. Parent will wait on the event." << std::endl;
+            bool delegateResult = RecursiveDelegate(5, &seParams, &seStackArgs, pNtContinue, pExitThread);
+
+            if (delegateResult) {
+                DEBUG_COUT("main: RecursiveDelegate for SetEvent reported success indication from child pipe." << std::endl);
+                DWORD waitResult = WaitForSingleObject(hEventForChild, 5000); // Wait for 5 seconds
+                if (waitResult == WAIT_OBJECT_0) {
+                    std::cout << "main: SUCCESS - Event was signaled by a delegated process!" << std::endl;
+                }
+                else if (waitResult == WAIT_TIMEOUT) {
+                    std::cout << "main: TIMEOUT - Event was NOT signaled by delegated process." << std::endl;
+                }
+                else {
+                    std::cout << "main: ERROR - WaitForSingleObject on event failed: " << GetLastError() << std::endl;
+                }
+            }
+            else {
+                std::cout << "main: RecursiveDelegate for SetEvent failed to complete." << std::endl;
+            }
+            CloseHandle(hEventForChild);
+        }
+        std::cout << "--- SetEvent Test Complete ---\n" << std::endl;
+
+
+        DEBUG_COUT("main: Parent process finished. Press any key to close..." << std::endl);
+        std::cin.get(); // Uncomment if you want to pause before exit
+        return overallResult ? 0 : 1;
+    }
 }
