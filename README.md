@@ -6,6 +6,7 @@
 > so that no single PID makes more than one cross-process Win32 call. The actual API is executed
 > by warping a thread's `CONTEXT` into the target function via `NtContinue`, with a hand-built
 > stack and an assembly stub that captures `RAX`.
+> The main goal is to troll the analyst a bit and make him be like wtf?...
 
 
 ---
