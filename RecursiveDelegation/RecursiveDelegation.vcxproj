@@ -130,6 +130,11 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="RecursiveDelegation.cpp" />
+    <ClCompile Include="RecursiveDelegationCore.cpp" />
+    <ClCompile Include="RecursiveDelegationEngine.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="RecursiveDelegationCore.h" />
   </ItemGroup>
   <ItemGroup>
     <MASM Include="CaptureStub.asm">
