@@ -7,11 +7,6 @@
 > by warping a thread's `CONTEXT` into the target function via `NtContinue`, with a hand-built
 > stack and an assembly stub that captures `RAX`.
 
-## ⚠️ For research only
-
-This project is a study of how attribution gets harder when an attacker spreads a kill chain
-across many short-lived processes. Do not run it against systems you don't own. Don't ship the
-clone-naming trick in anything that touches a real target. Etc.
 
 ---
 
