@@ -167,7 +167,7 @@ void RunAllDelegationTests() {
     std::cout << "============================================" << std::endl;
 }
 
-int InjectDllToNotepadTest(int recursiveDelegationLevel) {
+int InjectDllToNotepadTest(int recursiveDelegationLevel, const char* dllPath) {
     // Test inject calc dll to notepad
     HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
     if (!hNtdll) { // Should always be loaded
@@ -181,7 +181,7 @@ int InjectDllToNotepadTest(int recursiveDelegationLevel) {
     NtContinue_t pNtContinue = (NtContinue_t)GetProcAddress(hNtdll, "NtContinue");
 
     std::cout << "\n--- TESTING NOTEPAD DLL INJECTION ---" << std::endl;
-    const char* dllPath = "C:\\Users\\Argentix\\Downloads\\CalcDLL64.dll"; // MAKE SURE THIS PATH IS CORRECT
+    std::cout << "NotepadInjectionTest: DLL path: " << dllPath << std::endl;
 
     if (GetFileAttributesA(dllPath) == INVALID_FILE_ATTRIBUTES) {
         std::cerr << "NotepadInjectionTest: ERROR - DLL not found at: " << dllPath << std::endl;
@@ -672,15 +672,20 @@ int main(int argc, char* argv[]) {
             return InjectShellcodeToNotepadTest(level);
         }
         if (flag == "--inject-dll") {
-            int level = (argc >= 3) ? atoi(argv[2]) : recursiveDelegationLevel;
-            return InjectDllToNotepadTest(level);
+            if (argc < 4) {
+                std::cerr << "Usage: RecursiveDelegation.exe --inject-dll <level> <dll_path>" << std::endl;
+                return 1;
+            }
+            int level = atoi(argv[2]);
+            const char* dllPath = argv[3];
+            return InjectDllToNotepadTest(level, dllPath);
         }
         if (flag == "--selftest") {
             RunAllDelegationTests();
             return 0;
         }
         std::cerr << "Unknown flag: " << flag << std::endl;
-        std::cerr << "Usage: RecursiveDelegation.exe [--selftest|--inject-notepad [level]|--inject-dll [level]]" << std::endl;
+        std::cerr << "Usage: RecursiveDelegation.exe [--selftest|--inject-notepad [level]|--inject-dll <level> <dll_path>]" << std::endl;
         return 1;
     }
 
@@ -690,7 +695,7 @@ int main(int argc, char* argv[]) {
     RunAllDelegationTests();
     std::cin.get(); // Wait for user input before exiting
 
-    InjectDllToNotepadTest(recursiveDelegationLevel);
+    InjectDllToNotepadTest(recursiveDelegationLevel, "C:\\path\\to\\your.dll");
     std::cin.get(); // Wait for user input before exiting
 
     InjectShellcodeToNotepadTest(recursiveDelegationLevel);
